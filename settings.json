@@ -8,7 +8,7 @@
     "model_path": "yolov8m-pose.pt",
     "prefer_gpu": true,
     "use_openvino_cpu": false,
-    "model_thread_lock": false,
+    "model_thread_lock": true,
     "show_cuda_check": true
   },
   "detector": {

@@ -287,13 +287,21 @@ class HighResRunnerSuite:
         self.report_rows: List[Dict[str, Any]] = []
         self.report_lock = threading.Lock()
         self.model_lock = threading.Lock()
-        self.sr_lock = threading.Lock()
+        self.sr_lock = threading.Lock()  # guards the shared GFPGAN restorer only
+
+        # FSRCNN upscalers are created per-thread (cv2's DnnSuperResImpl is not
+        # safe to share), so super-resolution runs in parallel across CPU cores
+        # instead of being serialized behind one lock.
+        self._sr_tls = threading.local()
+        self._sr_ready = False
+        self._sr_model_path: Optional[str] = None
+        self._sr_scale = 3
 
         self.device_mode = "cpu"
         self.backend = "pytorch"
         self.model = self._setup_hardware_and_yolo()
-        self.sr = None
         self._setup_upscaler()
+        self._warmup_model()
 
     # ------------------------------------------------------------------
     # Setup
@@ -332,6 +340,37 @@ class HighResRunnerSuite:
             print(f"CUDA check failed: {exc}")
         print("--------------------\n")
 
+    def _warmup_model(self) -> None:
+        """Run one tiny inference on the main thread so ultralytics builds its
+        predictor / AutoBackend and moves the model onto the GPU exactly once,
+        before any worker threads start. Without this, the first wave of worker
+        threads can each trigger model setup concurrently and race on the CUDA
+        context -- which surfaces as 'CUDA error: misaligned address' inside
+        model.to(device). Failure here is non-fatal: the per-image error
+        handling still applies during the real run."""
+        try:
+            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+            self._predict(dummy)
+            print("--- [WARMUP] Model initialised and ready ---")
+        except Exception as exc:
+            print(f"[WARN] Model warm-up failed: {exc}")
+
+    @staticmethod
+    def _apply_fuse_guard(model):
+        """Work around ultralytics builds that crash while (re-)fusing the model
+        at load time -- "AttributeError: 'Conv' object has no attribute 'bn'",
+        raised from AutoBackend.load_model -> model.fuse(). Reporting the model
+        as already fused makes ultralytics skip that (buggy) Conv+BN fuse pass.
+        The model then runs un-fused: identical detections, only a small speed
+        cost. No-op on backends (e.g. OpenVINO) without a torch is_fused()."""
+        try:
+            underlying = getattr(model, "model", None)
+            if underlying is not None and hasattr(underlying, "is_fused"):
+                underlying.is_fused = lambda *args, **kwargs: True
+        except Exception:
+            pass
+        return model
+
     def _setup_hardware_and_yolo(self):
         model_path = self._resolve_path(str(self.cfg["hardware"].get("model_path", "yolov8m-pose.pt")))
         if not model_path.exists():
@@ -349,7 +388,7 @@ class HighResRunnerSuite:
                     self.backend = "pytorch"
                     torch.backends.cudnn.benchmark = True
                     print("--- [HARDWARE] NVIDIA GPU/CUDA active ---")
-                    return YOLO(str(model_path))
+                    return self._apply_fuse_guard(YOLO(str(model_path)))
             except Exception as exc:
                 print(f"[WARN] CUDA check failed, using fallback: {exc}")
 
@@ -366,7 +405,7 @@ class HighResRunnerSuite:
         self.device_mode = "cpu"
         self.backend = "pytorch"
         print("--- [HARDWARE] PyTorch CPU active ---")
-        return YOLO(str(model_path))
+        return self._apply_fuse_guard(YOLO(str(model_path)))
 
     def _setup_upscaler(self) -> None:
         iq = self.cfg["image_quality"]
@@ -379,14 +418,36 @@ class HighResRunnerSuite:
         if not model_path.exists() and not self._download_fsrcnn_model(model_path):
             print("[WARN] FSRCNN model unavailable. FSRCNN disabled.")
             return
+        # Validate the model loads once here (fail fast / clear message); the
+        # actual instances used for upscaling are created lazily per worker
+        # thread in _get_sr().
         try:
-            self.sr = cv2.dnn_superres.DnnSuperResImpl_create()
-            self.sr.readModel(str(model_path))
-            self.sr.setModel("fsrcnn", 3)
-            print("--- [AI PIXELS] FSRCNN loaded ---")
+            probe = cv2.dnn_superres.DnnSuperResImpl_create()
+            probe.readModel(str(model_path))
+            probe.setModel("fsrcnn", self._sr_scale)
         except Exception as exc:
             print(f"[WARN] FSRCNN could not be loaded: {exc}")
-            self.sr = None
+            return
+        self._sr_model_path = str(model_path)
+        self._sr_ready = True
+        print("--- [AI PIXELS] FSRCNN loaded (per-thread, parallel) ---")
+
+    def _get_sr(self):
+        """Return this thread's FSRCNN upscaler, creating it on first use.
+        Per-thread instances let super-resolution run concurrently across CPU
+        cores; cv2's DnnSuperResImpl is not safe to share between threads."""
+        if not self._sr_ready:
+            return None
+        sr = getattr(self._sr_tls, "sr", None)
+        if sr is None:
+            try:
+                sr = cv2.dnn_superres.DnnSuperResImpl_create()
+                sr.readModel(self._sr_model_path)
+                sr.setModel("fsrcnn", self._sr_scale)
+                self._sr_tls.sr = sr
+            except Exception:
+                return None
+        return sr
 
     def _download_fsrcnn_model(self, model_path: Path) -> bool:
         """Download the FSRCNN super-resolution weights automatically if they
@@ -929,10 +990,10 @@ class HighResRunnerSuite:
         target_h = int(iq.get("target_height", 4000))
         ratio = float(cp.get("aspect_ratio", 0.666))
 
-        if bool(iq.get("enable_fsrcnn", False)) and self.sr is not None and crop.shape[0] < int(iq.get("ai_upscaling_limit", 1200)):
+        sr = self._get_sr()
+        if sr is not None and crop.shape[0] < int(iq.get("ai_upscaling_limit", 1200)):
             try:
-                with self.sr_lock:
-                    crop = self.sr.upsample(crop)
+                crop = sr.upsample(crop)
             except Exception as exc:
                 print(f"[WARN] FSRCNN upscaling skipped: {exc}")
 
@@ -1491,13 +1552,13 @@ class HighResRunnerSuite:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         l_channel = clahe.apply(l_channel)
         enhanced = cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
-        if self.sr is not None:
+        sr = self._get_sr()
+        if sr is not None:
             try:
-                with self.sr_lock:
-                    # Keep the FSRCNN-upscaled result (more real detail) instead
-                    # of shrinking it back to the input size — the larger,
-                    # sharper image is the whole point of running SR here.
-                    enhanced = self.sr.upsample(enhanced)
+                # Keep the FSRCNN-upscaled result (more real detail) instead of
+                # shrinking it back to the input size — the larger, sharper
+                # image is the whole point of running SR here.
+                enhanced = sr.upsample(enhanced)
             except Exception:
                 pass
         return self.sharpen_image(enhanced)
@@ -1617,6 +1678,16 @@ class HighResRunnerSuite:
 
         workers = max(1, int(self.cfg["performance"].get("workers", 20)))
         batch_size = max(1, int(self.cfg["performance"].get("batch_size", 1)))
+
+        # With many Python worker threads, let each OpenCV call (decode, resize,
+        # FSRCNN, sharpen, JPEG encode) run single-threaded and get parallelism
+        # from the workers instead. Otherwise 32 workers x OpenCV's own thread
+        # pool massively oversubscribe the CPU and stall on context switching.
+        if workers > 1:
+            try:
+                cv2.setNumThreads(1)
+            except Exception:
+                pass
 
         # OpenVINO models are exported with a fixed batch size of 1 at export
         # time. Feeding a larger batch causes an input-shape mismatch error
