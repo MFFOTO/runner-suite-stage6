@@ -374,6 +374,62 @@ class HighResRunnerSuite:
             info["physical_cores"] = max(1, int(info["logical_cores"]) // 2)
         return info
 
+    @staticmethod
+    def _cpu_name() -> str:
+        """Best-effort friendly CPU brand string (e.g. '13th Gen Intel(R)
+        Core(TM) i9-13900HX'). Falls back to the platform identifier."""
+        try:
+            if platform.system() == "Windows":
+                import winreg  # type: ignore
+                key = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                )
+                try:
+                    name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+                finally:
+                    winreg.CloseKey(key)
+                if name:
+                    return str(name).strip()
+        except Exception:
+            pass
+        for fn in (platform.processor, platform.machine):
+            try:
+                value = fn()
+                if value:
+                    return str(value).strip()
+            except Exception:
+                pass
+        return "unknown CPU"
+
+    def _prompt_workers(self, cpu_name: str, cores: int, suggested: int) -> int:
+        """Show the detected CPU and a suggested worker count, then let the
+        user accept it (Y) or enter their own (N). Non-interactive input
+        (EOF/Ctrl-C) falls back to the suggestion."""
+        print(f"\nCPU detected:  {cpu_name}")
+        print(f"Logical cores: {cores}")
+        try:
+            answer = input(f"Use the suggested {suggested} worker threads? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"(no input -- using suggested {suggested})")
+            return suggested
+        if answer in ("", "y", "yes", "j", "ja"):
+            return suggested
+        while True:
+            try:
+                raw = input("Enter the number of worker threads to use: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(f"(no input -- using suggested {suggested})")
+                return suggested
+            try:
+                chosen = int(raw)
+            except ValueError:
+                print("Please enter a whole number, e.g. 8.")
+                continue
+            if chosen >= 1:
+                return chosen
+            print("Please enter a positive integer (1 or more).")
+
     def _auto_tune(self) -> None:
         """Fill any config value left as the string "auto" with a setting
         derived from the detected hardware. Explicit values in settings.json
@@ -389,6 +445,7 @@ class HighResRunnerSuite:
         cores = int(hw["logical_cores"])
         ram = float(hw["ram_gb"])
         vram = float(hw["vram_gb"])
+        cpu_name = self._cpu_name()
 
         def recommended_batch() -> int:
             if not cuda:
@@ -415,6 +472,19 @@ class HighResRunnerSuite:
         # Cap to keep thread/oversubscription overhead sane on big servers.
         workers = max(1, min(workers, 32))
 
+        # Worker count: suggest from the detected CPU, then let an interactive
+        # user accept (Y) or type their own (N). Pinning a number in
+        # settings.json skips the prompt; a non-interactive run (no TTY) uses
+        # the suggestion silently.
+        cur_workers = self.cfg.get("performance", {}).get("workers", "auto")
+        if isinstance(cur_workers, str) and cur_workers.strip().lower() == "auto":
+            if not auto:
+                workers = int(DEFAULT_CONFIG["performance"]["workers"])
+            elif sys.stdin is not None and sys.stdin.isatty():
+                workers = self._prompt_workers(cpu_name, cores, workers)
+            # else: non-interactive auto run -> keep the computed suggestion
+            self.cfg["performance"]["workers"] = workers
+
         # Model tier: keep the accurate medium model wherever there's a capable
         # GPU; step down to small on CPU-only or tiny-VRAM GPUs, and nano on ARM
         # where compute is scarcest. Any unlisted/unknown hardware falls through
@@ -432,7 +502,6 @@ class HighResRunnerSuite:
             ("hardware", "prefer_gpu"): cuda,
             ("hardware", "use_openvino_cpu"): (not cuda) and is_x86 and has_openvino,
             ("detector", "imgsz"): 1024 if cuda else (768 if is_x86 else 640),
-            ("performance", "workers"): workers,
             # Keep the validated single-image path by default; batching is an
             # opt-in lever (the profile below prints the VRAM-based suggestion).
             ("performance", "batch_size"): 1,
@@ -455,7 +524,7 @@ class HighResRunnerSuite:
 
         print("\n--- [AUTO-TUNE] ---")
         print(f"Mode:     {'hardware-adaptive' if auto else 'defaults (auto_hardware off)'}")
-        cpu_line = f"CPU:      {arch}, {cores} logical cores"
+        cpu_line = f"CPU:      {cpu_name} [{arch}], {cores} logical cores"
         if ram > 0:
             cpu_line += f", {ram:.1f} GB RAM"
         print(cpu_line)
