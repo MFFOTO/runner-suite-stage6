@@ -28,6 +28,7 @@ import csv
 import hashlib
 import json
 import os
+import platform
 import queue
 import subprocess
 import sys
@@ -69,6 +70,14 @@ except Exception:
     piexif = None  # type: ignore
     _MISSING_MODULES.append("piexif")
 
+# Optional: used by the hardware auto-tuner to read RAM and physical-core
+# counts. If absent, auto-tuning falls back to os.cpu_count() and skips the
+# RAM-based caps -- it is not required to run the suite.
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None  # type: ignore
+
 # Optional: face-restoration model for the C_Review AI-enhancement feature.
 # Not required to run the suite -- if missing, enhancement falls back to a
 # simpler upscale/contrast/sharpen pipeline using only OpenCV.
@@ -87,6 +96,10 @@ if _MISSING_MODULES:
 Box = Tuple[float, float, float, float]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # When true, any config value left as the string "auto" is filled in at
+    # startup from the detected hardware (GPU/VRAM, CPU arch/cores, RAM).
+    # Explicit values always win. Set false to use the built-in defaults below.
+    "auto_hardware": True,
     "paths": {
         "input_folder": "D:/20401/20401_originals/CCJU2LS1",
         "output_folder": "D:/RUN_OUT_PREMIUM",
@@ -222,6 +235,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "performance": {
         "workers": 20,
         "batch_size": 1,
+        "prefetch_maxsize": 4,
     },
     "debug": {
         "write_csv": True,
@@ -260,6 +274,7 @@ class HighResRunnerSuite:
         self.base_dir = Path(__file__).resolve().parent
         self.config_path = self._resolve_path(config_path)
         self.cfg = self._load_config(self.config_path)
+        self._auto_tune()
         self.output_folder = self._resolve_path(str(self.cfg["paths"]["output_folder"]))
         self.rejects_folder = self.output_folder / str(self.cfg["debug"].get("rejects_folder", "_rejects_stage6"))
 
@@ -319,6 +334,139 @@ class HighResRunnerSuite:
             user_cfg = json.load(f)
         return deep_merge(DEFAULT_CONFIG, user_cfg)
 
+    # ------------------------------------------------------------------
+    # Hardware auto-tuning
+    # ------------------------------------------------------------------
+    def _detect_hardware(self) -> Dict[str, Any]:
+        """Best-effort hardware probe. Every lookup is guarded so a missing
+        dependency (psutil) or a failed GPU query never aborts startup."""
+        info: Dict[str, Any] = {
+            "has_cuda": False,
+            "gpu_name": "",
+            "vram_gb": 0.0,
+            "arch": platform.machine().lower(),
+            "logical_cores": os.cpu_count() or 4,
+            "physical_cores": 0,
+            "ram_gb": 0.0,
+        }
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                info["has_cuda"] = True
+                info["gpu_name"] = props.name
+                info["vram_gb"] = props.total_memory / (1024 ** 3)
+        except Exception:
+            pass
+        if psutil is not None:
+            try:
+                info["physical_cores"] = psutil.cpu_count(logical=False) or 0
+                info["ram_gb"] = psutil.virtual_memory().total / (1024 ** 3)
+            except Exception:
+                pass
+        if not info["physical_cores"]:
+            info["physical_cores"] = max(1, int(info["logical_cores"]) // 2)
+        return info
+
+    def _auto_tune(self) -> None:
+        """Fill any config value left as the string "auto" with a setting
+        derived from the detected hardware. Explicit values in settings.json
+        are always kept. With "auto_hardware": false the "auto" sentinels
+        resolve to the built-in defaults instead of hardware-based picks."""
+        auto = bool(self.cfg.get("auto_hardware", True))
+        hw = self._detect_hardware()
+        arch = str(hw["arch"])
+        is_x86 = any(tag in arch for tag in ("amd64", "x86_64", "x64", "i386", "i686"))
+        is_arm = ("arm" in arch) or ("aarch64" in arch)
+        cuda = bool(hw["has_cuda"])
+        cores = int(hw["logical_cores"])
+        ram = float(hw["ram_gb"])
+        vram = float(hw["vram_gb"])
+
+        def recommended_batch() -> int:
+            if not cuda:
+                return 1
+            if vram >= 14:
+                return 8
+            if vram >= 10:
+                return 6
+            if vram >= 7:
+                return 4
+            if vram >= 5:
+                return 2
+            return 1
+
+        # workers: many on GPU (post-processing parallelism), few on a CPU
+        # backend (let the inference engine own the cores instead of
+        # oversubscribing). Capped by RAM (~0.3 GB per in-flight worker).
+        if cuda:
+            workers = cores
+        else:
+            workers = min(4, max(2, cores // 4))
+        if ram > 0:
+            workers = min(workers, max(2, int(ram * 0.6 / 0.3)))
+        # Cap to keep thread/oversubscription overhead sane on big servers.
+        workers = max(1, min(workers, 32))
+
+        # Model tier: keep the accurate medium model wherever there's a capable
+        # GPU; step down to small on CPU-only or tiny-VRAM GPUs, and nano on ARM
+        # where compute is scarcest. Any unlisted/unknown hardware falls through
+        # to the small model as a safe middle ground. Smaller weights are
+        # auto-fetched by ultralytics on first use if not present locally.
+        if cuda:
+            model_choice = "yolov8m-pose.pt" if (vram >= 4 or vram == 0) else "yolov8s-pose.pt"
+        elif is_arm:
+            model_choice = "yolov8n-pose.pt"
+        else:
+            model_choice = "yolov8s-pose.pt"
+
+        picks: Dict[Tuple[str, str], Any] = {
+            ("hardware", "model_path"): model_choice,
+            ("hardware", "prefer_gpu"): cuda,
+            ("hardware", "use_openvino_cpu"): (not cuda) and is_x86,
+            ("detector", "imgsz"): 1024 if cuda else (768 if is_x86 else 640),
+            ("performance", "workers"): workers,
+            # Keep the validated single-image path by default; batching is an
+            # opt-in lever (the profile below prints the VRAM-based suggestion).
+            ("performance", "batch_size"): 1,
+            ("performance", "prefetch_maxsize"): 4 if ram >= 24 else 2,
+            ("image_quality", "enable_fsrcnn"): (cores >= 8) and not is_arm,
+            ("image_quality", "ai_upscaling_limit"): 1200 if cores >= 16 else (800 if cores >= 8 else 500),
+        }
+
+        for (section, key), auto_value in picks.items():
+            cur = self.cfg.get(section, {}).get(key, "auto")
+            if isinstance(cur, str) and cur.strip().lower() == "auto":
+                self.cfg[section][key] = auto_value if auto else DEFAULT_CONFIG[section][key]
+
+        if cuda and bool(self.cfg["hardware"]["prefer_gpu"]):
+            backend = f"cuda ({hw['gpu_name']})"
+        elif bool(self.cfg["hardware"]["use_openvino_cpu"]):
+            backend = "openvino-cpu"
+        else:
+            backend = "pytorch-cpu"
+
+        print("\n--- [AUTO-TUNE] ---")
+        print(f"Mode:     {'hardware-adaptive' if auto else 'defaults (auto_hardware off)'}")
+        cpu_line = f"CPU:      {arch}, {cores} logical cores"
+        if ram > 0:
+            cpu_line += f", {ram:.1f} GB RAM"
+        print(cpu_line)
+        print(f"GPU:      {hw['gpu_name']} ({vram:.1f} GB)" if cuda else "GPU:      none")
+        print(f"Backend:  {backend}")
+        print(f"Model:    {self.cfg['hardware']['model_path']}")
+        print(
+            f"Tuned:    imgsz={self.cfg['detector']['imgsz']}  workers={self.cfg['performance']['workers']}  "
+            f"batch={self.cfg['performance']['batch_size']}  prefetch={self.cfg['performance']['prefetch_maxsize']}  "
+            f"fsrcnn={bool(self.cfg['image_quality']['enable_fsrcnn'])}(limit {self.cfg['image_quality']['ai_upscaling_limit']})"
+        )
+        if psutil is None:
+            print("Note:     psutil not installed -- RAM/physical-core tuning skipped (using cpu_count).")
+        if cuda and recommended_batch() > 1 and int(self.cfg["performance"]["batch_size"]) == 1:
+            print(f"Tip:      this GPU can likely handle batch_size={recommended_batch()} "
+                  f"-- set it explicitly to enable the batched path.")
+        print("-------------------\n")
+
     def _show_cuda_info(self) -> None:
         if not bool(self.cfg["hardware"].get("show_cuda_check", True)):
             return
@@ -372,8 +520,17 @@ class HighResRunnerSuite:
         return model
 
     def _setup_hardware_and_yolo(self):
-        model_path = self._resolve_path(str(self.cfg["hardware"].get("model_path", "yolov8m-pose.pt")))
-        if not model_path.exists():
+        model_value = str(self.cfg["hardware"].get("model_path", "yolov8m-pose.pt"))
+        model_path = self._resolve_path(model_value)
+        if model_path.exists():
+            model_arg = str(model_path)
+        elif Path(model_value).name == model_value and not Path(model_value).is_absolute():
+            # A bare ultralytics model name (e.g. an auto-tiered yolov8s-pose.pt)
+            # that isn't on disk yet -- let ultralytics fetch it from its model
+            # hub. A missing *path* (with directories) is treated as an error.
+            print(f"[INFO] Model '{model_value}' not present locally -- ultralytics will download it on first use.")
+            model_arg = model_value
+        else:
             raise FileNotFoundError(f"YOLO model not found: {model_path}")
 
         self._show_cuda_info()
@@ -388,15 +545,16 @@ class HighResRunnerSuite:
                     self.backend = "pytorch"
                     torch.backends.cudnn.benchmark = True
                     print("--- [HARDWARE] NVIDIA GPU/CUDA active ---")
-                    return self._apply_fuse_guard(YOLO(str(model_path)))
+                    return self._apply_fuse_guard(YOLO(model_arg))
             except Exception as exc:
                 print(f"[WARN] CUDA check failed, using fallback: {exc}")
 
         if use_openvino_cpu:
-            ov_dir = self._resolve_path(str(self.cfg["hardware"].get("openvino_model_dir", "yolov8m-pose_openvino_model")))
+            default_ov = f"{Path(model_value).stem}_openvino_model"
+            ov_dir = self._resolve_path(str(self.cfg["hardware"].get("openvino_model_dir", default_ov)))
             if not ov_dir.exists():
                 print("--- [HARDWARE] Generating OpenVINO model for CPU ... ---")
-                YOLO(str(model_path)).export(format="openvino", imgsz=int(self.cfg["detector"].get("imgsz", 1024)))
+                YOLO(model_arg).export(format="openvino", imgsz=int(self.cfg["detector"].get("imgsz", 1024)))
             self.device_mode = "cpu"
             self.backend = "openvino"
             print("--- [HARDWARE] CPU/OpenVINO active ---")
@@ -405,7 +563,7 @@ class HighResRunnerSuite:
         self.device_mode = "cpu"
         self.backend = "pytorch"
         print("--- [HARDWARE] PyTorch CPU active ---")
-        return self._apply_fuse_guard(YOLO(str(model_path)))
+        return self._apply_fuse_guard(YOLO(model_arg))
 
     def _setup_upscaler(self) -> None:
         iq = self.cfg["image_quality"]
@@ -1722,9 +1880,11 @@ class HighResRunnerSuite:
             progress = tqdm(total=len(imgs), desc="Runner-Crops") if tqdm is not None else None
             post_pool: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
             read_pool = ThreadPoolExecutor(max_workers=workers)
-            # Queue depth of 4: keeps more batches pre-decoded so the GPU is less
-            # likely to stall waiting for I/O, especially on slower storage.
-            batch_queue: "queue.Queue" = queue.Queue(maxsize=4)
+            # Prefetch depth keeps batches pre-decoded so the GPU is less likely
+            # to stall waiting for I/O; the auto-tuner lowers it on low-RAM
+            # machines so high-res batches don't blow the memory budget.
+            prefetch_maxsize = max(1, int(self.cfg["performance"].get("prefetch_maxsize", 4)))
+            batch_queue: "queue.Queue" = queue.Queue(maxsize=prefetch_maxsize)
             producer = threading.Thread(
                 target=self._prefetch_batches,
                 args=(batches, read_pool, batch_queue),

@@ -1,18 +1,19 @@
 {
+  "auto_hardware": true,
   "paths": {
     "input_folder": "D:/20401/20401_originals/CCJU2LS1",
     "output_folder": "D:/RUN_OUT_PREMIUM",
     "recursive": false
   },
   "hardware": {
-    "model_path": "yolov8m-pose.pt",
-    "prefer_gpu": true,
-    "use_openvino_cpu": false,
+    "model_path": "auto",
+    "prefer_gpu": "auto",
+    "use_openvino_cpu": "auto",
     "model_thread_lock": true,
     "show_cuda_check": true
   },
   "detector": {
-    "imgsz": 1024,
+    "imgsz": "auto",
     "iou": 0.55,
     "max_det": 120
   },
@@ -81,8 +82,8 @@
   },
   "image_quality": {
     "target_height": 4000,
-    "enable_fsrcnn": true,
-    "ai_upscaling_limit": 1200,
+    "enable_fsrcnn": "auto",
+    "ai_upscaling_limit": "auto",
     "fsrcnn_model_path": "FSRCNN_x3.pb",
     "auto_download_fsrcnn": true,
     "fsrcnn_model_url": "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x3.pb",
@@ -115,8 +116,9 @@
     }
   },
   "performance": {
-    "workers": 20,
-    "batch_size": 1
+    "workers": "auto",
+    "batch_size": "auto",
+    "prefetch_maxsize": "auto"
   },
   "debug": {
     "write_csv": true,
