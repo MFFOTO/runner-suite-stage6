@@ -3,3 +3,7 @@ ultralytics>=8.2.0
 piexif>=1.1.3
 tqdm>=4.66
 psutil>=5.9
+
+# Optional: faster inference on x86 CPUs with no GPU (Intel/AMD). If absent,
+# the suite auto-falls back to the PyTorch CPU backend.
+# openvino>=2024.0

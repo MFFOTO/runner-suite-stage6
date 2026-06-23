@@ -348,6 +348,7 @@ class HighResRunnerSuite:
             "logical_cores": os.cpu_count() or 4,
             "physical_cores": 0,
             "ram_gb": 0.0,
+            "has_openvino": False,
         }
         try:
             import torch  # type: ignore
@@ -356,6 +357,11 @@ class HighResRunnerSuite:
                 info["has_cuda"] = True
                 info["gpu_name"] = props.name
                 info["vram_gb"] = props.total_memory / (1024 ** 3)
+        except Exception:
+            pass
+        try:
+            import importlib.util
+            info["has_openvino"] = importlib.util.find_spec("openvino") is not None
         except Exception:
             pass
         if psutil is not None:
@@ -379,6 +385,7 @@ class HighResRunnerSuite:
         is_x86 = any(tag in arch for tag in ("amd64", "x86_64", "x64", "i386", "i686"))
         is_arm = ("arm" in arch) or ("aarch64" in arch)
         cuda = bool(hw["has_cuda"])
+        has_openvino = bool(hw.get("has_openvino", False))
         cores = int(hw["logical_cores"])
         ram = float(hw["ram_gb"])
         vram = float(hw["vram_gb"])
@@ -423,7 +430,7 @@ class HighResRunnerSuite:
         picks: Dict[Tuple[str, str], Any] = {
             ("hardware", "model_path"): model_choice,
             ("hardware", "prefer_gpu"): cuda,
-            ("hardware", "use_openvino_cpu"): (not cuda) and is_x86,
+            ("hardware", "use_openvino_cpu"): (not cuda) and is_x86 and has_openvino,
             ("detector", "imgsz"): 1024 if cuda else (768 if is_x86 else 640),
             ("performance", "workers"): workers,
             # Keep the validated single-image path by default; batching is an
@@ -462,6 +469,9 @@ class HighResRunnerSuite:
         )
         if psutil is None:
             print("Note:     psutil not installed -- RAM/physical-core tuning skipped (using cpu_count).")
+        if (not cuda) and is_x86 and not has_openvino:
+            print("Tip:      'pip install openvino' enables a faster x86 CPU backend "
+                  "(currently using PyTorch CPU).")
         if cuda and recommended_batch() > 1 and int(self.cfg["performance"]["batch_size"]) == 1:
             print(f"Tip:      this GPU can likely handle batch_size={recommended_batch()} "
                   f"-- set it explicitly to enable the batched path.")
@@ -550,15 +560,20 @@ class HighResRunnerSuite:
                 print(f"[WARN] CUDA check failed, using fallback: {exc}")
 
         if use_openvino_cpu:
-            default_ov = f"{Path(model_value).stem}_openvino_model"
-            ov_dir = self._resolve_path(str(self.cfg["hardware"].get("openvino_model_dir", default_ov)))
-            if not ov_dir.exists():
-                print("--- [HARDWARE] Generating OpenVINO model for CPU ... ---")
-                YOLO(model_arg).export(format="openvino", imgsz=int(self.cfg["detector"].get("imgsz", 1024)))
-            self.device_mode = "cpu"
-            self.backend = "openvino"
-            print("--- [HARDWARE] CPU/OpenVINO active ---")
-            return YOLO(str(ov_dir), task="pose")
+            try:
+                default_ov = f"{Path(model_value).stem}_openvino_model"
+                ov_dir = self._resolve_path(str(self.cfg["hardware"].get("openvino_model_dir", default_ov)))
+                if not ov_dir.exists():
+                    print("--- [HARDWARE] Generating OpenVINO model for CPU ... ---")
+                    YOLO(model_arg).export(format="openvino", imgsz=int(self.cfg["detector"].get("imgsz", 1024)))
+                self.device_mode = "cpu"
+                self.backend = "openvino"
+                print("--- [HARDWARE] CPU/OpenVINO active ---")
+                return YOLO(str(ov_dir), task="pose")
+            except Exception as exc:
+                # openvino package missing or export failed -- don't crash the
+                # whole run; fall through to the plain PyTorch CPU backend.
+                print(f"[WARN] OpenVINO setup failed ({exc}); falling back to PyTorch CPU.")
 
         self.device_mode = "cpu"
         self.backend = "pytorch"
