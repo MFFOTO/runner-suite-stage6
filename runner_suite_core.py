@@ -409,12 +409,15 @@ class HighResRunnerSuite:
         print(f"\nCPU detected:  {cpu_name}")
         print(f"Logical cores: {cores}")
         try:
-            answer = input(f"Use the suggested {suggested} worker threads? [Y/n]: ").strip().lower()
+            answer = input(f"Use the suggested {suggested} worker threads? [Y/n, or type a number]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print(f"(no input -- using suggested {suggested})")
             return suggested
         if answer in ("", "y", "yes", "j", "ja"):
             return suggested
+        # Allow typing the desired count directly at this prompt.
+        if answer.isdigit() and int(answer) >= 1:
+            return int(answer)
         while True:
             try:
                 raw = input("Enter the number of worker threads to use: ").strip()
@@ -466,7 +469,10 @@ class HighResRunnerSuite:
         if cuda:
             workers = cores
         else:
-            workers = min(4, max(2, cores // 4))
+            # CPU backend: inference is serialized (model_thread_lock), so extra
+            # workers mainly speed up the parallel post-processing. Use about
+            # half the logical cores, leaving headroom for the inference engine.
+            workers = max(2, min(cores // 2, 16))
         if ram > 0:
             workers = min(workers, max(2, int(ram * 0.6 / 0.3)))
         # Cap to keep thread/oversubscription overhead sane on big servers.
