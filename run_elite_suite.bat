@@ -38,6 +38,10 @@ call ".venv\Scripts\activate.bat"
 rem Use the venv interpreter explicitly so a Store/global "python" on PATH
 rem can never shadow it (that mismatch hides venv-only packages like
 rem onnxruntime-directml).
+rem PYTHONNOUSERSITE=1: ignore the per-user site-packages. Microsoft Store
+rem Python venvs leak that folder into sys.path, where a stray plain
+rem onnxruntime can shadow the venv's onnxruntime-directml (DirectML).
+set "PYTHONNOUSERSITE=1"
 ".venv\Scripts\python.exe" check_cuda_environment.py
 ".venv\Scripts\python.exe" runner_suite_core.py
 
