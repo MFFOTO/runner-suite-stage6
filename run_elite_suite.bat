@@ -35,8 +35,11 @@ if not exist "yolov8m-pose.pt" (
 )
 
 call ".venv\Scripts\activate.bat"
-python check_cuda_environment.py
-python runner_suite_core.py
+rem Use the venv interpreter explicitly so a Store/global "python" on PATH
+rem can never shadow it (that mismatch hides venv-only packages like
+rem onnxruntime-directml).
+".venv\Scripts\python.exe" check_cuda_environment.py
+".venv\Scripts\python.exe" runner_suite_core.py
 
 echo.
 echo Lauf beendet.
