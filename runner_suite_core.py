@@ -364,6 +364,12 @@ class HighResRunnerSuite:
             info["has_openvino"] = importlib.util.find_spec("openvino") is not None
         except Exception:
             pass
+        info["onnx_providers"] = []
+        try:
+            import onnxruntime as ort  # type: ignore
+            info["onnx_providers"] = list(ort.get_available_providers())
+        except Exception:
+            pass
         if psutil is not None:
             try:
                 info["physical_cores"] = psutil.cpu_count(logical=False) or 0
@@ -445,6 +451,8 @@ class HighResRunnerSuite:
         is_arm = ("arm" in arch) or ("aarch64" in arch)
         cuda = bool(hw["has_cuda"])
         has_openvino = bool(hw.get("has_openvino", False))
+        onnx_providers = hw.get("onnx_providers", [])
+        has_dml = "DmlExecutionProvider" in onnx_providers
         cores = int(hw["logical_cores"])
         ram = float(hw["ram_gb"])
         vram = float(hw["vram_gb"])
@@ -499,7 +507,14 @@ class HighResRunnerSuite:
         if cuda:
             model_choice = "yolov8m-pose.pt" if (vram >= 4 or vram == 0) else "yolov8s-pose.pt"
         elif is_arm:
-            model_choice = "yolov8n-pose.pt"
+            # On ARM, run the ONNX model on the GPU via DirectML when both a
+            # provider and an exported yolov8n-pose.onnx are present; otherwise
+            # the nano .pt on the (emulated) CPU.
+            onnx_model = self._resolve_path("yolov8n-pose.onnx")
+            if has_dml and onnx_model.exists():
+                model_choice = "yolov8n-pose.onnx"
+            else:
+                model_choice = "yolov8n-pose.pt"
         else:
             model_choice = "yolov8s-pose.pt"
 
@@ -521,8 +536,11 @@ class HighResRunnerSuite:
             if isinstance(cur, str) and cur.strip().lower() == "auto":
                 self.cfg[section][key] = auto_value if auto else DEFAULT_CONFIG[section][key]
 
+        model_is_onnx = str(self.cfg["hardware"]["model_path"]).lower().endswith(".onnx")
         if cuda and bool(self.cfg["hardware"]["prefer_gpu"]):
             backend = f"cuda ({hw['gpu_name']})"
+        elif model_is_onnx and has_dml:
+            backend = "onnxruntime / DirectML (GPU)"
         elif bool(self.cfg["hardware"]["use_openvino_cpu"]):
             backend = "openvino-cpu"
         else:
@@ -547,6 +565,10 @@ class HighResRunnerSuite:
         if (not cuda) and is_x86 and not has_openvino:
             print("Tip:      'pip install openvino' enables a faster x86 CPU backend "
                   "(currently using PyTorch CPU).")
+        if is_arm and has_dml and not str(self.cfg["hardware"]["model_path"]).lower().endswith(".onnx"):
+            print("Tip:      DirectML GPU is available. Export 'yolov8n-pose.onnx' "
+                  "(yolo export model=yolov8n-pose.pt format=onnx imgsz=640) into this")
+            print("          folder to run inference on the Adreno GPU instead of the CPU.")
         if cuda and recommended_batch() > 1 and int(self.cfg["performance"]["batch_size"]) == 1:
             print(f"Tip:      this GPU can likely handle batch_size={recommended_batch()} "
                   f"-- set it explicitly to enable the batched path.")
@@ -604,6 +626,33 @@ class HighResRunnerSuite:
             pass
         return model
 
+    @staticmethod
+    def _install_onnx_provider_patch() -> str:
+        """Make ultralytics' ONNX inference run on the best available execution
+        provider. ultralytics' ONNX backend would otherwise default to CPU; we
+        wrap onnxruntime.InferenceSession to inject DirectML (Adreno GPU on
+        Snapdragon) ahead of CPU, so only the heavy conv work moves to the GPU
+        while ultralytics keeps doing pre/post-processing. Returns the provider
+        name that will be used."""
+        import onnxruntime as ort  # type: ignore
+        available = ort.get_available_providers()
+        # DirectML first (broad GPU support, no model changes). QNN/NPU needs an
+        # INT8 model + provider options, so it's left to a dedicated future path.
+        accel = "DmlExecutionProvider" if "DmlExecutionProvider" in available else ""
+        if not accel:
+            return "CPUExecutionProvider"
+        providers = [accel, "CPUExecutionProvider"]
+        if not getattr(ort, "_runner_suite_patched", False):
+            _orig_session = ort.InferenceSession
+
+            def _patched_session(*args, **kwargs):
+                kwargs["providers"] = providers
+                return _orig_session(*args, **kwargs)
+
+            ort.InferenceSession = _patched_session
+            ort._runner_suite_patched = True
+        return accel
+
     def _setup_hardware_and_yolo(self):
         model_value = str(self.cfg["hardware"].get("model_path", "yolov8m-pose.pt"))
         model_path = self._resolve_path(model_value)
@@ -621,6 +670,19 @@ class HighResRunnerSuite:
         self._show_cuda_info()
         prefer_gpu = bool(self.cfg["hardware"].get("prefer_gpu", True))
         use_openvino_cpu = bool(self.cfg["hardware"].get("use_openvino_cpu", False))
+
+        # ONNX model -> run through ultralytics' ONNX backend, but force the
+        # session onto an accelerated provider (DirectML GPU / QNN NPU) when one
+        # is available. ultralytics still does all pre/post-processing.
+        if model_arg.lower().endswith(".onnx"):
+            try:
+                provider = self._install_onnx_provider_patch()
+                self.device_mode = "cpu"
+                self.backend = "onnx"
+                print(f"--- [HARDWARE] ONNX Runtime active (provider: {provider}) ---")
+                return self._apply_fuse_guard(YOLO(model_arg))
+            except Exception as exc:
+                print(f"[WARN] ONNX backend setup failed ({exc}); falling back to PyTorch CPU.")
 
         if prefer_gpu:
             try:

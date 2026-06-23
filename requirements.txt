@@ -7,3 +7,8 @@ psutil>=5.9
 # Optional: faster inference on x86 CPUs with no GPU (Intel/AMD). If absent,
 # the suite auto-falls back to the PyTorch CPU backend.
 # openvino>=2024.0
+
+# Optional: GPU acceleration on Snapdragon / Windows-on-ARM via DirectML.
+# Needs an exported yolov8n-pose.onnx in the project folder; the suite then
+# auto-selects the Adreno GPU. Falls back to PyTorch CPU if absent.
+# onnxruntime-directml>=1.18
