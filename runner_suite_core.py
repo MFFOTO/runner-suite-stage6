@@ -857,11 +857,11 @@ class HighResRunnerSuite:
         }
         if self.backend == "pytorch":
             kwargs["device"] = self.device_mode
-            # FP16 for single-image inference only. Batched calls use FP32 because
-            # some ultralytics versions call model.fuse() on every predict() with
-            # half=True, which throws AttributeError once the model is already fused.
-            cuda = str(self.device_mode).startswith("cuda")
-            kwargs["half"] = cuda and not batch
+            # We deliberately do NOT pass an FP16 flag. Newer ultralytics renamed
+            # the predict arg 'half' -> 'quantize' and logs a deprecation warning
+            # on *every* predict() call, which floods the console. FP16 bought
+            # little here anyway (inference isn't the bottleneck; post-processing
+            # is), so we run at the default precision.
         else:
             kwargs["device"] = "cpu"
 
