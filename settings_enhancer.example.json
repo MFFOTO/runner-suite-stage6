@@ -94,6 +94,11 @@
     "realesrgan_model_sha256": "",
     "realesrgan_tile": 400,
     "realesrgan_auto_install": true,
+    "enhance_by_class": {
+      "premium": "none",
+      "good": "upscale",
+      "review": "upscale+face"
+    },
     "sharpening": "medium",
     "denoise": false,
     "jpeg_quality": 95,
@@ -101,7 +106,7 @@
   },
   "quality_scoring": {
     "save_quality_subfolders": true,
-    "save_review": false,
+    "save_review": true,
     "hard_reject_below_score": 62,
     "classes": {
       "premium": 73,

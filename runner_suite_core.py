@@ -217,6 +217,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "realesrgan_model_sha256": "",
         "realesrgan_tile": 256,
         "realesrgan_auto_install": True,
+        # Per-quality-class enhancement. Modes: "none" (Lanczos only),
+        # "upscale" (Real-ESRGAN/FSRCNN), "upscale+face" (Real-ESRGAN + GFPGAN
+        # face restoration). Default: same "upscale" for every class (the fast
+        # suite's behaviour); the ENHANCER preset overrides per class.
+        "enhance_by_class": {"premium": "upscale", "good": "upscale", "review": "upscale"},
         "sharpening": "strong",
         "denoise": False,
         "jpeg_quality": 95,
@@ -330,11 +335,16 @@ class HighResRunnerSuite:
         self._realesrgan_lock = threading.Lock()
         self._realesrgan_scale = 4
 
+        # GFPGAN face restorer for the "upscale+face" enhance mode (shares the
+        # Real-ESRGAN lock so GPU work stays serialized). None unless loaded.
+        self._face_restorer = None
+
         self.device_mode = "cpu"
         self.backend = "pytorch"
         self.model = self._setup_hardware_and_yolo()
         self._setup_upscaler()
         self._setup_realesrgan()
+        self._setup_pipeline_face_restorer()
         self._warmup_model()
 
     # ------------------------------------------------------------------
@@ -896,6 +906,52 @@ class HighResRunnerSuite:
                 print(f"[WARN] FSRCNN upscaling skipped: {exc}")
         return crop
 
+    def _setup_pipeline_face_restorer(self) -> None:
+        """Load GFPGAN (with Real-ESRGAN as the background upsampler) for the
+        'upscale+face' enhance mode. Only set up when some quality class asks
+        for faces AND Real-ESRGAN is available (GPU). Otherwise 'upscale+face'
+        degrades gracefully to plain upscaling."""
+        modes = self.cfg["image_quality"].get("enhance_by_class", {})
+        if not any("face" in str(m).lower() for m in modes.values()):
+            return
+        if self._realesrgan is None:
+            print("[WARN] Face restoration needs the Real-ESRGAN GPU pipeline; 'upscale+face' -> upscaling.")
+            return
+        if not self._ensure_gfpgan_ready() or GFPGANer is None:
+            print("[WARN] GFPGAN not available; 'upscale+face' -> upscaling.")
+            return
+        re_cfg = self.cfg.get("review_enhancement", {})
+        model_path = self._resolve_path(str(re_cfg.get("gfpgan_model_path", "GFPGANv1.4.pth")))
+        try:
+            self._face_restorer = GFPGANer(
+                model_path=str(model_path),
+                upscale=self._realesrgan_scale,
+                arch="clean",
+                channel_multiplier=2,
+                bg_upsampler=self._realesrgan,
+            )
+            print("--- [AI PIXELS] GFPGAN face restoration active (Real-ESRGAN background) ---")
+        except Exception as exc:
+            print(f"[WARN] Could not load GFPGAN ({exc}); 'upscale+face' -> upscaling.")
+            self._face_restorer = None
+
+    def _apply_face_restore(self, crop: Any) -> Any:
+        """GFPGAN face restoration + Real-ESRGAN background in one pass.
+        Serialized on the Real-ESRGAN lock (GPU); falls back to plain upscaling
+        on any error."""
+        if self._face_restorer is None:
+            return self._apply_upscaler(crop)
+        try:
+            with self._realesrgan_lock:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _, _, out = self._face_restorer.enhance(
+                        crop, has_aligned=False, only_center_face=False, paste_back=True
+                    )
+            return out if out is not None else crop
+        except Exception as exc:
+            print(f"[WARN] Face restoration skipped ({exc}); upscaling instead.")
+            return self._apply_upscaler(crop)
+
     def _download_fsrcnn_model(self, model_path: Path) -> bool:
         """Download the FSRCNN super-resolution weights automatically if they
         are missing and 'auto_download_fsrcnn' is enabled (mirrors the GFPGAN
@@ -1431,16 +1487,21 @@ class HighResRunnerSuite:
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
-    def resize_final(self, crop: Any) -> Any:
+    def resize_final(self, crop: Any, enhance_mode: str = "upscale") -> Any:
         iq = self.cfg["image_quality"]
         cp = self.cfg["crop"]
         target_h = int(iq.get("target_height", 4000))
         ratio = float(cp.get("aspect_ratio", 0.666))
 
-        # Super-resolve small crops before the final resize (Real-ESRGAN on GPU
-        # for the ENHANCER preset, else thread-local FSRCNN).
-        if crop.shape[0] < int(iq.get("ai_upscaling_limit", 1200)):
-            crop = self._apply_upscaler(crop)
+        # Enhance small crops before the final resize, per the requested mode:
+        #   "none"         -> no SR, Lanczos only (e.g. Premium -- already sharp)
+        #   "upscale"      -> Real-ESRGAN / FSRCNN super-resolution (e.g. Good)
+        #   "upscale+face" -> Real-ESRGAN + GFPGAN face restoration (e.g. Review)
+        if enhance_mode != "none" and crop.shape[0] < int(iq.get("ai_upscaling_limit", 1200)):
+            if enhance_mode == "upscale+face" and self._face_restorer is not None:
+                crop = self._apply_face_restore(crop)
+            else:
+                crop = self._apply_upscaler(crop)
 
         # Center-crop to the exact target aspect ratio BEFORE scaling so the
         # output is never stretched. get_smart_crop already aims for this ratio
@@ -1767,7 +1828,12 @@ class HighResRunnerSuite:
                         details["enhancement_candidate_reason"] = candidate_reason
                 details["enhancement_candidate"] = bool(is_enhancement_candidate)
 
-                final = self.resize_final(crop)
+                # Per-class enhancement (ENHANCER): e.g. Premium -> Lanczos only,
+                # Good -> Real-ESRGAN, Review -> Real-ESRGAN + face restoration.
+                enhance_mode = str(self.cfg["image_quality"].get("enhance_by_class", {}).get(quality_class, "upscale"))
+                details["enhance_mode"] = enhance_mode
+
+                final = self.resize_final(crop, enhance_mode=enhance_mode)
                 final = self.denoise_image(final)
                 final = self.sharpen_image(final)
                 out_path = self.write_output(img_path, i, final, sharpness, conf, score, quality_class, subfolder=enhancement_subfolder)
