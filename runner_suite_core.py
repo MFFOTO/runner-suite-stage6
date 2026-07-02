@@ -205,6 +205,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # discarded instead of being saved. Set to "" to skip the hash check
         # (a structural sanity check still runs).
         "fsrcnn_model_sha256": "efd38655a815908c6c8954db6052f128e76a735f1de657894c477d0dc0b64481",
+        # Upscaler for small crops: "fsrcnn" (fast, CPU) or "realesrgan"
+        # (much higher quality, GPU-only -- used by the ENHANCER preset). If
+        # realesrgan is requested but no CUDA GPU / library / model is
+        # available, it falls back to FSRCNN, then plain Lanczos.
+        "upscaler": "fsrcnn",
+        "realesrgan_model_path": "RealESRGAN_x4plus.pth",
+        "realesrgan_model_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "realesrgan_model_sha256": "",
+        "realesrgan_tile": 0,
+        "realesrgan_auto_install": True,
         "sharpening": "strong",
         "denoise": False,
         "jpeg_quality": 95,
@@ -312,10 +322,17 @@ class HighResRunnerSuite:
         self._sr_model_path: Optional[str] = None
         self._sr_scale = 3
 
+        # Real-ESRGAN upscaler (ENHANCER preset). Shared GPU model, guarded by a
+        # lock; None unless successfully loaded on a CUDA machine.
+        self._realesrgan = None
+        self._realesrgan_lock = threading.Lock()
+        self._realesrgan_scale = 4
+
         self.device_mode = "cpu"
         self.backend = "pytorch"
         self.model = self._setup_hardware_and_yolo()
         self._setup_upscaler()
+        self._setup_realesrgan()
         self._warmup_model()
 
     # ------------------------------------------------------------------
@@ -758,6 +775,121 @@ class HighResRunnerSuite:
             except Exception:
                 return None
         return sr
+
+    def _setup_realesrgan(self) -> None:
+        """Load Real-ESRGAN as the upscaler when image_quality.upscaler is
+        'realesrgan' (the ENHANCER preset). GPU-only: it needs CUDA, the
+        realesrgan/basicsr libraries, and the model weights. Any of those
+        missing -> leave self._realesrgan = None and the pipeline falls back to
+        FSRCNN, then Lanczos. Never fatal."""
+        iq = self.cfg["image_quality"]
+        if str(iq.get("upscaler", "fsrcnn")).lower() != "realesrgan":
+            return
+        try:
+            import torch  # type: ignore
+            cuda = torch.cuda.is_available()
+        except Exception:
+            cuda = False
+        if not cuda:
+            print("[WARN] Real-ESRGAN requested but no CUDA GPU -- using FSRCNN/Lanczos instead.")
+            return
+
+        # basicsr imports torchvision.transforms.functional_tensor, which newer
+        # torchvision (>= 0.17, i.e. torch 2.x) removed. Alias it to the current
+        # module so the import succeeds.
+        try:
+            import torchvision.transforms.functional as _tvf  # type: ignore
+            sys.modules.setdefault("torchvision.transforms.functional_tensor", _tvf)
+        except Exception:
+            pass
+
+        def _import_realesrgan():
+            from realesrgan import RealESRGANer  # type: ignore
+            from basicsr.archs.rrdbnet_arch import RRDBNet  # type: ignore
+            return RealESRGANer, RRDBNet
+
+        try:
+            RealESRGANer, RRDBNet = _import_realesrgan()
+        except Exception as exc:
+            if not bool(iq.get("realesrgan_auto_install", True)):
+                print(f"[WARN] realesrgan/basicsr not available ({exc}); using FSRCNN/Lanczos.")
+                return
+            print("[AI PIXELS] Installing realesrgan + basicsr (one-time, can take a few minutes) ...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "realesrgan", "basicsr"])
+                RealESRGANer, RRDBNet = _import_realesrgan()
+            except Exception as exc2:
+                print(f"[WARN] Could not install/import realesrgan ({exc2}); using FSRCNN/Lanczos.")
+                return
+        model_path = self._resolve_path(str(iq.get("realesrgan_model_path", "RealESRGAN_x4plus.pth")))
+        if not model_path.exists() and not self._download_realesrgan_model(model_path):
+            print("[WARN] Real-ESRGAN model unavailable; using FSRCNN/Lanczos.")
+            return
+        try:
+            net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+            self._realesrgan = RealESRGANer(
+                scale=4,
+                model_path=str(model_path),
+                model=net,
+                tile=int(iq.get("realesrgan_tile", 0)),
+                tile_pad=10,
+                pre_pad=0,
+                half=True,
+                device="cuda",
+            )
+            self._realesrgan_scale = 4
+            print("--- [AI PIXELS] Real-ESRGAN x4 loaded (GPU) ---")
+        except Exception as exc:
+            print(f"[WARN] Real-ESRGAN could not be loaded: {exc}; using FSRCNN/Lanczos.")
+            self._realesrgan = None
+
+    def _download_realesrgan_model(self, model_path: Path) -> bool:
+        """Auto-download the Real-ESRGAN weights (mirrors the FSRCNN/GFPGAN
+        downloaders: temp file -> validate -> promote). Returns True on success."""
+        iq = self.cfg["image_quality"]
+        url = str(iq.get("realesrgan_model_url", "")).strip()
+        if not url:
+            print(f"[WARN] Real-ESRGAN model missing at {model_path} and no URL configured.")
+            return False
+        print(f"[AI PIXELS] Real-ESRGAN model not found -- downloading weights to {model_path} ...")
+        tmp_path = model_path.with_name(model_path.name + ".part")
+        try:
+            import urllib.request
+            ensure_dir(model_path.parent)
+            urllib.request.urlretrieve(url, str(tmp_path))
+        except Exception as exc:
+            self._unlink_quietly(tmp_path)
+            print(f"[WARN] Could not download Real-ESRGAN model: {exc}")
+            return False
+        expected_sha = str(iq.get("realesrgan_model_sha256", "")).strip().lower()
+        ok, reason = self._validate_model_download(tmp_path, expected_sha, min_bytes=1_000_000)
+        if not ok:
+            self._unlink_quietly(tmp_path)
+            print(f"[WARN] Downloaded Real-ESRGAN model failed validation ({reason}). Discarding it.")
+            return False
+        tmp_path.replace(model_path)
+        print("[AI PIXELS] Real-ESRGAN model download complete (validated).")
+        return True
+
+    def _apply_upscaler(self, crop: Any) -> Any:
+        """Super-resolve a small crop. Prefers Real-ESRGAN (GPU, ENHANCER) when
+        loaded; otherwise thread-local FSRCNN; otherwise returns the crop
+        unchanged (the caller's final Lanczos resize still runs)."""
+        if self._realesrgan is not None:
+            try:
+                with self._realesrgan_lock:
+                    out, _ = self._realesrgan.enhance(crop, outscale=self._realesrgan_scale)
+                return out
+            except Exception as exc:
+                print(f"[WARN] Real-ESRGAN upscaling skipped: {exc}")
+                return crop
+        sr = self._get_sr()
+        if sr is not None:
+            try:
+                return sr.upsample(crop)
+            except Exception as exc:
+                print(f"[WARN] FSRCNN upscaling skipped: {exc}")
+        return crop
 
     def _download_fsrcnn_model(self, model_path: Path) -> bool:
         """Download the FSRCNN super-resolution weights automatically if they
@@ -1300,12 +1432,10 @@ class HighResRunnerSuite:
         target_h = int(iq.get("target_height", 4000))
         ratio = float(cp.get("aspect_ratio", 0.666))
 
-        sr = self._get_sr()
-        if sr is not None and crop.shape[0] < int(iq.get("ai_upscaling_limit", 1200)):
-            try:
-                crop = sr.upsample(crop)
-            except Exception as exc:
-                print(f"[WARN] FSRCNN upscaling skipped: {exc}")
+        # Super-resolve small crops before the final resize (Real-ESRGAN on GPU
+        # for the ENHANCER preset, else thread-local FSRCNN).
+        if crop.shape[0] < int(iq.get("ai_upscaling_limit", 1200)):
+            crop = self._apply_upscaler(crop)
 
         # Center-crop to the exact target aspect ratio BEFORE scaling so the
         # output is never stretched. get_smart_crop already aims for this ratio
@@ -2079,4 +2209,7 @@ class HighResRunnerSuite:
 
 
 if __name__ == "__main__":
-    HighResRunnerSuite().run()
+    # Optional config path arg lets a launcher pick a preset, e.g. the ENHANCER
+    # variant:  python runner_suite_core.py settings_enhancer.json
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "settings.json"
+    HighResRunnerSuite(config_file).run()
