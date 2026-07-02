@@ -24,8 +24,10 @@ Required files in the same folder:
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
+import io
 import json
 import os
 import platform
@@ -878,7 +880,10 @@ class HighResRunnerSuite:
         if self._realesrgan is not None:
             try:
                 with self._realesrgan_lock:
-                    out, _ = self._realesrgan.enhance(crop, outscale=self._realesrgan_scale)
+                    # Real-ESRGAN prints a line per tile ("Tile 9/24"); swallow
+                    # that so it doesn't bury the progress bar.
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        out, _ = self._realesrgan.enhance(crop, outscale=self._realesrgan_scale)
                 return out
             except Exception as exc:
                 print(f"[WARN] Real-ESRGAN upscaling skipped: {exc}")
