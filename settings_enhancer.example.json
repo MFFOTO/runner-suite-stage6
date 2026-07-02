@@ -83,7 +83,7 @@
   "image_quality": {
     "target_height": 4000,
     "enable_fsrcnn": "auto",
-    "ai_upscaling_limit": 1600,
+    "ai_upscaling_limit": 800,
     "fsrcnn_model_path": "FSRCNN_x3.pb",
     "auto_download_fsrcnn": true,
     "fsrcnn_model_url": "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x3.pb",
@@ -92,7 +92,7 @@
     "realesrgan_model_path": "RealESRGAN_x4plus.pth",
     "realesrgan_model_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
     "realesrgan_model_sha256": "",
-    "realesrgan_tile": 256,
+    "realesrgan_tile": 400,
     "realesrgan_auto_install": true,
     "sharpening": "medium",
     "denoise": false,
