@@ -8,6 +8,15 @@ echo   HighRes Runner Suite Stage 6 - Setup
 echo =======================================================
 echo.
 
+if not exist "settings.json" (
+    if exist "settings.example.json" (
+        echo [0/5] Erstelle settings.json aus settings.example.json ...
+        copy "settings.example.json" "settings.json" >nul
+        echo        Bitte input_folder und output_folder in settings.json anpassen.
+        echo.
+    )
+)
+
 where python >nul 2>&1
 if errorlevel 1 (
     echo [FEHLER] Python wurde nicht gefunden.
