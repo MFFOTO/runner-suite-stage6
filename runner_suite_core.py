@@ -213,7 +213,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "realesrgan_model_path": "RealESRGAN_x4plus.pth",
         "realesrgan_model_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
         "realesrgan_model_sha256": "",
-        "realesrgan_tile": 0,
+        "realesrgan_tile": 256,
         "realesrgan_auto_install": True,
         "sharpening": "strong",
         "denoise": False,
