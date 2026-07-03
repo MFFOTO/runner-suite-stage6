@@ -737,6 +737,19 @@ class HighResRunnerSuite:
         Snapdragon) ahead of CPU, so only the heavy conv work moves to the GPU
         while ultralytics keeps doing pre/post-processing. Returns the provider
         name that will be used."""
+        # Stop ultralytics' auto-updater from pip-installing plain onnx/onnxruntime
+        # when it loads the .onnx: that overwrites onnxruntime-directml (same
+        # module), the install fails on the locked DLL, and inference silently
+        # drops back to CPU. We manage the runtime, so disable that check.
+        os.environ["YOLO_AUTOINSTALL"] = "false"
+        for _mod in ("ultralytics.nn.autobackend", "ultralytics.utils.checks"):
+            try:
+                import importlib
+                m = importlib.import_module(_mod)
+                if hasattr(m, "check_requirements"):
+                    m.check_requirements = lambda *args, **kwargs: True
+            except Exception:
+                pass
         import onnxruntime as ort  # type: ignore
         available = ort.get_available_providers()
         # DirectML first (broad GPU support, no model changes). QNN/NPU needs an
