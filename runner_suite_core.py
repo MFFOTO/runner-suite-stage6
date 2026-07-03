@@ -289,6 +289,7 @@ def ensure_dir(path: Path) -> None:
 class HighResRunnerSuite:
     def __init__(self, config_path: str = "settings.json"):
         self.base_dir = Path(__file__).resolve().parent
+        self._silence_ultralytics_deprecation()
         self.config_path = self._resolve_path(config_path)
         self.cfg = self._load_config(self.config_path)
         self._auto_tune()
@@ -362,6 +363,30 @@ class HighResRunnerSuite:
         with open(path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         return deep_merge(DEFAULT_CONFIG, user_cfg)
+
+    @staticmethod
+    def _silence_ultralytics_deprecation() -> None:
+        """Keep FP16 (half=True) for speed without the per-predict console spam:
+        newer ultralytics logs "'half' is deprecated" on every call. Drop just
+        those messages from its logger (and the warnings channel)."""
+        try:
+            import logging
+
+            class _DropDeprecated(logging.Filter):
+                def filter(self, record: logging.LogRecord) -> bool:
+                    try:
+                        return "deprecated" not in record.getMessage().lower()
+                    except Exception:
+                        return True
+
+            logging.getLogger("ultralytics").addFilter(_DropDeprecated())
+        except Exception:
+            pass
+        try:
+            import warnings
+            warnings.filterwarnings("ignore", message=r".*deprecated.*", module=r".*ultralytics.*")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Hardware auto-tuning
@@ -1050,11 +1075,12 @@ class HighResRunnerSuite:
         }
         if self.backend == "pytorch":
             kwargs["device"] = self.device_mode
-            # We deliberately do NOT pass an FP16 flag. Newer ultralytics renamed
-            # the predict arg 'half' -> 'quantize' and logs a deprecation warning
-            # on *every* predict() call, which floods the console. FP16 bought
-            # little here anyway (inference isn't the bottleneck; post-processing
-            # is), so we run at the default precision.
+            # FP16 for single-image CUDA inference (roughly 2x faster than FP32
+            # on the GPU). Batched calls stay FP32 -- some ultralytics versions
+            # re-fuse the model on every predict() with half=True. The per-call
+            # "half is deprecated" log is silenced in __init__.
+            if str(self.device_mode).startswith("cuda") and not batch:
+                kwargs["half"] = True
         else:
             kwargs["device"] = "cpu"
 
