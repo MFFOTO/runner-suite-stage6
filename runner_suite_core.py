@@ -111,6 +111,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "model_path": "yolov8m-pose.pt",
         "prefer_gpu": True,
         "use_openvino_cpu": False,
+        # Run inference on a DirectX-12 GPU via onnxruntime-directml when an
+        # exported .onnx is present. "auto" = on for ARM (Snapdragon/Adreno);
+        # set true to also use it on x86 (e.g. an Intel Arc iGPU).
+        "prefer_directml": "auto",
         "model_thread_lock": False,
         "show_cuda_check": True,
     },
@@ -559,18 +563,25 @@ class HighResRunnerSuite:
         # to the small model as a safe middle ground. Smaller weights are
         # auto-fetched by ultralytics on first use if not present locally.
         if cuda:
-            model_choice = "yolov8m-pose.pt" if (vram >= 4 or vram == 0) else "yolov8s-pose.pt"
+            base_model = "yolov8m-pose.pt" if (vram >= 4 or vram == 0) else "yolov8s-pose.pt"
         elif is_arm:
-            # On ARM, run the ONNX model on the GPU via DirectML when both a
-            # provider and an exported yolov8n-pose.onnx are present; otherwise
-            # the nano .pt on the (emulated) CPU.
-            onnx_model = self._resolve_path("yolov8n-pose.onnx")
-            if has_dml and onnx_model.exists():
-                model_choice = "yolov8n-pose.onnx"
-            else:
-                model_choice = "yolov8n-pose.pt"
+            base_model = "yolov8n-pose.pt"
         else:
-            model_choice = "yolov8s-pose.pt"
+            base_model = "yolov8s-pose.pt"
+
+        # DirectML GPU path: run the ONNX form of that model on a DirectX-12 GPU
+        # (Adreno on Snapdragon, Intel Arc on x86). Auto-enabled on ARM; opt-in
+        # on x86 via hardware.prefer_directml=true, so it doesn't misfire on
+        # boxes whose only DX12 device is a weak display adapter.
+        prefer_dml = str(self.cfg["hardware"].get("prefer_directml", "auto")).strip().lower()
+        want_dml = (not cuda) and has_dml and (
+            prefer_dml in ("1", "true", "yes", "on") or (prefer_dml == "auto" and is_arm)
+        )
+        onnx_name = base_model.replace(".pt", ".onnx")
+        if want_dml and self._resolve_path(onnx_name).exists():
+            model_choice = onnx_name
+        else:
+            model_choice = base_model
 
         picks: Dict[Tuple[str, str], Any] = {
             ("hardware", "model_path"): model_choice,
@@ -619,10 +630,14 @@ class HighResRunnerSuite:
         if (not cuda) and is_x86 and not has_openvino:
             print("Tip:      'pip install openvino' enables a faster x86 CPU backend "
                   "(currently using PyTorch CPU).")
-        if is_arm and has_dml and not str(self.cfg["hardware"]["model_path"]).lower().endswith(".onnx"):
-            print("Tip:      DirectML GPU is available. Export 'yolov8n-pose.onnx' "
-                  "(yolo export model=yolov8n-pose.pt format=onnx imgsz=640) into this")
-            print("          folder to run inference on the Adreno GPU instead of the CPU.")
+        if want_dml and not str(self.cfg["hardware"]["model_path"]).lower().endswith(".onnx"):
+            imgsz_now = int(self.cfg["detector"]["imgsz"])
+            print(f"Tip:      DirectML GPU available. Export '{onnx_name}' "
+                  f"(yolo export model={base_model} format=onnx imgsz={imgsz_now}) into")
+            print("          this folder to run inference on the GPU instead of the CPU.")
+        elif (not cuda) and not is_arm and has_dml and prefer_dml == "auto":
+            print("Tip:      A DirectML GPU (e.g. Intel Arc) was detected. Set "
+                  "hardware.prefer_directml=true + export the .onnx to use it.")
         if cuda and recommended_batch() > 1 and int(self.cfg["performance"]["batch_size"]) == 1:
             print(f"Tip:      this GPU can likely handle batch_size={recommended_batch()} "
                   f"-- set it explicitly to enable the batched path.")
