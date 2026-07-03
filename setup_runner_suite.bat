@@ -30,6 +30,13 @@ if not exist ".venv\Scripts\python.exe" (
     python -m venv .venv
     if errorlevel 1 (
         echo [FEHLER] Virtuelle Umgebung konnte nicht erstellt werden.
+        echo.
+        echo Meist ist kein echtes Python installiert - nur der Microsoft-Store-Platzhalter.
+        echo   1. Echtes Python installieren:  winget install -e --id Python.Python.3.12
+        echo      oder von https://www.python.org/downloads/ mit "Add python.exe to PATH".
+        echo   2. Store-Aliase deaktivieren: Einstellungen, Apps, Erweiterte App-Einstellungen,
+        echo      App-Ausfuehrungsaliase, dann python.exe und python3.exe ausschalten.
+        echo   3. Neues Terminal oeffnen und setup_runner_suite.bat erneut starten.
         pause
         exit /b 1
     )
