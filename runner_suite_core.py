@@ -436,7 +436,25 @@ class HighResRunnerSuite:
                 pass
         if not info["physical_cores"]:
             info["physical_cores"] = max(1, int(info["logical_cores"]) // 2)
+        info["gpu_names"] = self._detect_gpu_names()
         return info
+
+    @staticmethod
+    def _detect_gpu_names() -> List[str]:
+        """Names of the display adapters (Windows), so the tuner can recognise a
+        capable non-CUDA GPU (Intel Arc / AMD discrete) and enable DirectML on
+        its own. Best-effort; returns [] on failure or non-Windows."""
+        if platform.system() != "Windows":
+            return []
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                stderr=subprocess.DEVNULL, timeout=15,
+            )
+            return [ln.strip() for ln in out.decode(errors="ignore").splitlines() if ln.strip()]
+        except Exception:
+            return []
 
     @staticmethod
     def _cpu_name() -> str:
@@ -569,13 +587,22 @@ class HighResRunnerSuite:
         else:
             base_model = "yolov8s-pose.pt"
 
+        # Recognise a capable non-CUDA GPU by name (Intel Arc iGPU/dGPU, AMD
+        # discrete Radeon RX/Pro). Weak display adapters (Intel UHD/Iris) are
+        # deliberately excluded -- DirectML on those is slower than the CPU.
+        gpu_names = [str(n).lower() for n in hw.get("gpu_names", [])]
+        has_capable_dml_gpu = any(
+            ("arc" in n) or ("radeon" in n and ("rx" in n or "pro" in n))
+            for n in gpu_names
+        )
+
         # DirectML GPU path: run the ONNX form of that model on a DirectX-12 GPU
-        # (Adreno on Snapdragon, Intel Arc on x86). Auto-enabled on ARM; opt-in
-        # on x86 via hardware.prefer_directml=true, so it doesn't misfire on
-        # boxes whose only DX12 device is a weak display adapter.
+        # (Adreno on Snapdragon, Intel Arc on x86). "auto" enables it on ARM or
+        # whenever a capable Arc/discrete GPU is detected; true forces it on.
         prefer_dml = str(self.cfg["hardware"].get("prefer_directml", "auto")).strip().lower()
         want_dml = (not cuda) and has_dml and (
-            prefer_dml in ("1", "true", "yes", "on") or (prefer_dml == "auto" and is_arm)
+            prefer_dml in ("1", "true", "yes", "on")
+            or (prefer_dml == "auto" and (is_arm or has_capable_dml_gpu))
         )
         onnx_name = base_model.replace(".pt", ".onnx")
         if want_dml and self._resolve_path(onnx_name).exists():
@@ -617,7 +644,13 @@ class HighResRunnerSuite:
         if ram > 0:
             cpu_line += f", {ram:.1f} GB RAM"
         print(cpu_line)
-        print(f"GPU:      {hw['gpu_name']} ({vram:.1f} GB)" if cuda else "GPU:      none")
+        if cuda:
+            print(f"GPU:      {hw['gpu_name']} ({vram:.1f} GB)")
+        elif hw.get("gpu_names"):
+            print(f"GPU:      {', '.join(hw['gpu_names'])}"
+                  + ("  [DirectML-capable]" if has_capable_dml_gpu else ""))
+        else:
+            print("GPU:      none")
         print(f"Backend:  {backend}")
         print(f"Model:    {self.cfg['hardware']['model_path']}")
         print(
@@ -635,9 +668,10 @@ class HighResRunnerSuite:
             print(f"Tip:      DirectML GPU available. Export '{onnx_name}' "
                   f"(yolo export model={base_model} format=onnx imgsz={imgsz_now}) into")
             print("          this folder to run inference on the GPU instead of the CPU.")
-        elif (not cuda) and not is_arm and has_dml and prefer_dml == "auto":
-            print("Tip:      A DirectML GPU (e.g. Intel Arc) was detected. Set "
-                  "hardware.prefer_directml=true + export the .onnx to use it.")
+        elif (not cuda) and has_capable_dml_gpu and not has_dml:
+            print("Tip:      A DirectML-capable GPU (e.g. Intel Arc) was detected but "
+                  "onnxruntime-directml isn't installed.")
+            print("          'pip install onnxruntime-directml' + export the .onnx to run on it.")
         if cuda and recommended_batch() > 1 and int(self.cfg["performance"]["batch_size"]) == 1:
             print(f"Tip:      this GPU can likely handle batch_size={recommended_batch()} "
                   f"-- set it explicitly to enable the batched path.")
