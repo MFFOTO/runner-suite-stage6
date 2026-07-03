@@ -660,7 +660,7 @@ class HighResRunnerSuite:
         )
         if psutil is None:
             print("Note:     psutil not installed -- RAM/physical-core tuning skipped (using cpu_count).")
-        if (not cuda) and is_x86 and not has_openvino:
+        if (not cuda) and is_x86 and not has_openvino and not model_is_onnx:
             print("Tip:      'pip install openvino' enables a faster x86 CPU backend "
                   "(currently using PyTorch CPU).")
         if want_dml and not str(self.cfg["hardware"]["model_path"]).lower().endswith(".onnx"):
