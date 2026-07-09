@@ -1,5 +1,6 @@
 opencv-contrib-python>=4.10,<4.12
 ultralytics>=8.2.0
+lap>=0.5.12  # required by video_suite.py's ByteTrack multi-runner tracking
 piexif>=1.1.3
 tqdm>=4.66
 psutil>=5.9
