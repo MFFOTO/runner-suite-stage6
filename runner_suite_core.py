@@ -631,7 +631,9 @@ class HighResRunnerSuite:
             ("hardware", "model_path"): model_choice,
             ("hardware", "prefer_gpu"): cuda,
             ("hardware", "use_openvino_cpu"): (not cuda) and is_x86 and has_openvino,
-            ("detector", "imgsz"): 1024 if cuda else (768 if is_x86 else 640),
+            # 1280 on GPU improves keypoint recall on hunched/occluded riders
+            # (fewer partial/cut-off detections); CPU/ARM stay lower for speed.
+            ("detector", "imgsz"): 1280 if cuda else (768 if is_x86 else 640),
             # Keep the validated single-image path by default; batching is an
             # opt-in lever (the profile below prints the VRAM-based suggestion).
             ("performance", "batch_size"): 1,

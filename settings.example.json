@@ -13,7 +13,7 @@
     "show_cuda_check": true
   },
   "detector": {
-    "imgsz": "auto",
+    "imgsz": 1280,
     "iou": 0.55,
     "max_det": 120
   },
