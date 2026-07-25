@@ -156,6 +156,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # the bottom). 0.25 keeps the head in the upper third instead of clipping
         # it; 0.5 would trim symmetrically (the old behaviour).
         "vertical_trim_top_fraction": 0.25,
+        # Framing method:
+        #   "pad"     -> pad the detection box by fixed fractions, then fill the
+        #                aspect ratio (legacy; can push the runner up + add floor).
+        #   "anatomy" -> lock the vertical extent to head-top .. foot-bottom with
+        #                fixed margins and DERIVE the width from the aspect ratio.
+        #                Frames the runner head-to-toe at any vantage (low/center/
+        #                high) with no arbitrary floor. The pad_* values are unused
+        #                in this mode.
+        "mode": "pad",
+        "anatomy_headroom_ratio": 0.08,     # sky kept above the crown (x person height)
+        "anatomy_footroom_ratio": 0.06,     # ground kept below the feet
+        "anatomy_crown_allowance": 0.06,    # crown height above the face keypoints
+        "anatomy_side_margin": 0.12,        # extra width beyond the runner when width-limited
     },
     "completeness_guard": {
         # Keeps partial / cut-off athletes out of A_Premium / B_Good: a crop
@@ -1348,6 +1361,46 @@ class HighResRunnerSuite:
             "ok_for_premium": not demote, "reason": reason,
         }
 
+    def _anatomy_crop_box(self, kp: Any, box: Box, keypoint_conf: float, cp: Dict[str, Any]) -> Box:
+        """Anatomy-anchored framing (vantage-invariant). Lock the vertical extent
+        to head-top .. foot-bottom with small fixed margins and DERIVE the width
+        from the aspect ratio, so the runner is framed head-to-toe whether shot
+        from low, level, or high -- without the arbitrary 'floor' the pad method
+        adds when it fills the aspect ratio vertically. Returns (x1, y1, x2, y2)."""
+        bx1, by1, bx2, by2 = box
+        ph = max(1.0, by2 - by1)
+        ratio = float(cp.get("aspect_ratio", 0.666))
+        cg = self.cfg.get("completeness_guard", {})
+
+        def _conf(i: int) -> bool:
+            return kp is not None and i < len(kp) and float(kp[i][2]) > keypoint_conf
+
+        head_ys = [float(kp[i][1]) for i in (0, 1, 2, 3, 4) if _conf(i)]
+        shoulder_ys = [float(kp[i][1]) for i in (5, 6) if _conf(i)]
+        ankle_ys = [float(kp[i][1]) for i in (15, 16) if _conf(i)]
+
+        # Head-top: the crown sits above the face keypoints; when the head is weak
+        # (high vantage) estimate it above the shoulders. Fall back to the box top.
+        if head_ys:
+            head_top = min(by1, min(head_ys) - ph * float(cp.get("anatomy_crown_allowance", 0.06)))
+        elif shoulder_ys:
+            head_top = min(by1, (sum(shoulder_ys) / len(shoulder_ys)) - ph * float(cg.get("head_estimate_ratio", 0.22)))
+        else:
+            head_top = by1
+        foot_bottom = max([by2] + ankle_ys)
+
+        person_h = max(1.0, foot_bottom - head_top)
+        top = head_top - person_h * float(cp.get("anatomy_headroom_ratio", 0.08))
+        bottom = foot_bottom + person_h * float(cp.get("anatomy_footroom_ratio", 0.06))
+
+        crop_w = (bottom - top) * ratio
+        runner_w = (bx2 - bx1) * (1.0 + float(cp.get("anatomy_side_margin", 0.12)))
+        if crop_w < runner_w:                     # arms out / wide stance -> grow downward
+            crop_w = runner_w
+            bottom = top + crop_w / ratio
+        cx = (bx1 + bx2) / 2.0
+        return cx - crop_w / 2.0, top, cx + crop_w / 2.0, bottom
+
     def get_smart_crop(self, img: Any, kp: Any, person_box: Box) -> Optional[Tuple[Any, Box]]:
         h_img, w_img = img.shape[:2]
         cp = self.cfg["crop"]
@@ -1361,6 +1414,21 @@ class HighResRunnerSuite:
             y1 = min(y1, float(np.min(valid[:, 1])))
             x2 = max(x2, float(np.max(valid[:, 0])))
             y2 = max(y2, float(np.max(valid[:, 1])))
+
+        # Anatomy-anchored framing (opt-in via crop.mode="anatomy"). Uses a plain
+        # clip (not the shift-to-fit below) so a head near the source top is not
+        # pushed downward into a floor of empty ground; resize_final does any
+        # final aspect correction, bottom-biased and head-safe.
+        if str(cp.get("mode", "pad")).lower() == "anatomy":
+            ax1, ay1, ax2, ay2 = self._anatomy_crop_box(kp, (x1, y1, x2, y2), keypoint_conf, cp)
+            x1i = int(clamp(ax1, 0, w_img - 1))
+            y1i = int(clamp(ay1, 0, h_img - 1))
+            x2i = int(clamp(ax2, x1i + 1, w_img))
+            y2i = int(clamp(ay2, y1i + 1, h_img))
+            crop = img[y1i:y2i, x1i:x2i]
+            if crop is None or crop.size == 0:
+                return None
+            return crop, (float(x1i), float(y1i), float(x2i), float(y2i))
 
         # Head-safe framing. Two failure modes this guards against:
         #  * hunched cyclists (head low/forward/occluded), and
