@@ -276,7 +276,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "hard_reject_below_score": 62,
         "classes": {
             "premium": 73,
-            "good": 65,
+            "good": 60,
             "review": 45,
         },
         "excellent_sharpness": 300,
