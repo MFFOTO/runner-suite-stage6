@@ -151,6 +151,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "pad_bottom": 0.28,
         "small_person_threshold_px": 700,
         "small_person_extra_pad_multiplier": 1.15,
+        # When resize_final has to trim height to hit the target aspect ratio,
+        # this is the fraction of the excess removed from the TOP (the rest from
+        # the bottom). 0.25 keeps the head in the upper third instead of clipping
+        # it; 0.5 would trim symmetrically (the old behaviour).
+        "vertical_trim_top_fraction": 0.25,
     },
     "completeness_guard": {
         # Keeps partial / cut-off athletes out of A_Premium / B_Good: a crop
@@ -242,6 +247,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enhance_by_class": {"premium": "upscale", "good": "upscale", "review": "upscale"},
         "sharpening": "strong",
         "denoise": False,
+        # Premium crops are selected for already being sharp, so the global
+        # denoise + sharpen passes are skipped for them by default (avoids
+        # over-sharpening your best frames). Set True to post-process Premium
+        # like Good/Review.
+        "post_process_premium": False,
         "jpeg_quality": 95,
         "preserve_exif": True,
     },
@@ -1684,7 +1694,11 @@ class HighResRunnerSuite:
             crop = crop[:, x0:x0 + new_w]
         elif current_ratio < ratio:
             new_h = max(1, int(round(w / ratio)))
-            y0 = max(0, (h - new_h) // 2)
+            excess = h - new_h
+            # Bias the vertical trim toward the bottom so the head (upper third)
+            # is preserved rather than symmetrically clipped near frame edges.
+            top_frac = float(cp.get("vertical_trim_top_fraction", 0.25))
+            y0 = int(clamp(round(excess * top_frac), 0, max(0, excess)))
             crop = crop[y0:y0 + new_h, :]
 
         final_w = max(1, int(round(target_h * ratio)))
@@ -2026,8 +2040,12 @@ class HighResRunnerSuite:
                 details["enhance_mode"] = enhance_mode
 
                 final = self.resize_final(crop, enhance_mode=enhance_mode)
-                final = self.denoise_image(final)
-                final = self.sharpen_image(final)
+                # Premium crops are already sharp; skip the global denoise/sharpen
+                # so the best frames aren't over-processed (override with
+                # image_quality.post_process_premium).
+                if quality_class != "premium" or bool(self.cfg["image_quality"].get("post_process_premium", False)):
+                    final = self.denoise_image(final)
+                    final = self.sharpen_image(final)
                 out_path = self.write_output(img_path, i, final, sharpness, conf, score, quality_class, subfolder=enhancement_subfolder)
                 if out_path is None:
                     self._inc("write_failed")
