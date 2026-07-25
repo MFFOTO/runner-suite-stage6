@@ -152,6 +152,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "small_person_threshold_px": 700,
         "small_person_extra_pad_multiplier": 1.15,
     },
+    "completeness_guard": {
+        # Keeps partial / cut-off athletes out of A_Premium / B_Good: a crop
+        # missing the head or whole upper body, or truncated by the frame top,
+        # is SOFT-routed to C_Review by default (nothing is discarded). Aimed at
+        # dense / occluded events (MTB start corrals, tight courses) where the
+        # pose model returns a partial box (legs-only, or head clipped).
+        "enabled": True,
+        "require_upper_body": True,     # need a head OR both shoulders for A/B
+        "truncation_guard": True,       # detect a head cut off by the frame top
+        "edge_margin_px": 6,            # px from a border that counts as "touching"
+        "review_on_partial": True,      # True = demote to Review; False = reject
+        "head_extend": True,            # grow the crop up to include an occluded head
+        "head_extend_ratio": 0.7,       # head room above shoulders, x torso length
+    },
     "fence_detection": {
         "enabled": True,
         "bright_threshold": 210,
@@ -316,6 +330,9 @@ class HighResRunnerSuite:
             "fence_rejected": 0,
             "low_quality_score": 0,
             "crop_failed": 0,
+            "partial_body": 0,
+            "truncated_frame": 0,
+            "demoted_partial": 0,
             "fallback_saved": 0,
             "write_failed": 0,
             "errors": 0,
@@ -1273,6 +1290,50 @@ class HighResRunnerSuite:
         h, w = img.shape[:2]
         return img, (0.0, 0.0, float(w), float(h))
 
+    def _assess_completeness(self, kp: Any, person_box: Box, img_shape: Tuple[int, int]) -> Dict[str, Any]:
+        """Judge whether a detection covers a whole athlete or a partial/cut-off
+        one, using which COCO-17 keypoint groups are confidently present and
+        whether the person box is jammed against a frame edge. Used to keep
+        partial crops out of Premium/Good rather than to reject outright."""
+        cg = self.cfg.get("completeness_guard", {})
+        h_img, w_img = img_shape
+        kc = float(self.cfg["selection_filters"].get("keypoint_conf", 0.30))
+
+        def conf(i: int) -> bool:
+            return kp is not None and i < len(kp) and float(kp[i][2]) > kc
+
+        has_head = any(conf(i) for i in (0, 1, 2, 3, 4))
+        both_shoulders = conf(5) and conf(6)
+        any_shoulder = conf(5) or conf(6)
+        has_hips = conf(11) or conf(12)
+        has_legs = any(conf(i) for i in (13, 14, 15, 16))
+        has_upper_body = has_head or both_shoulders
+        partial_lower_body = (has_hips or has_legs) and not has_upper_body
+
+        zones = [has_head, any_shoulder, has_hips, conf(13) or conf(14), conf(15) or conf(16)]
+        completeness = sum(1 for z in zones if z) / float(len(zones))
+
+        margin = float(cg.get("edge_margin_px", 6))
+        y1, y2 = float(person_box[1]), float(person_box[3])
+        truncated_top = bool(cg.get("truncation_guard", True)) and (y1 <= margin) and not has_head
+        truncated_bottom = (y2 >= h_img - margin) and not has_legs  # informational (feet cut is OK)
+
+        demote = (bool(cg.get("require_upper_body", True)) and not has_upper_body) or truncated_top
+        reason = None
+        if partial_lower_body:
+            reason = "partial_lower_body"
+        elif truncated_top:
+            reason = "truncated_head"
+        elif not has_upper_body:
+            reason = "no_upper_body"
+        return {
+            "has_head": has_head, "has_upper_body": has_upper_body,
+            "partial_lower_body": partial_lower_body,
+            "truncated_top": truncated_top, "truncated_bottom": truncated_bottom,
+            "completeness": round(completeness, 3),
+            "ok_for_premium": not demote, "reason": reason,
+        }
+
     def get_smart_crop(self, img: Any, kp: Any, person_box: Box) -> Optional[Tuple[Any, Box]]:
         h_img, w_img = img.shape[:2]
         cp = self.cfg["crop"]
@@ -1286,6 +1347,23 @@ class HighResRunnerSuite:
             y1 = min(y1, float(np.min(valid[:, 1])))
             x2 = max(x2, float(np.max(valid[:, 0])))
             y2 = max(y2, float(np.max(valid[:, 1])))
+
+        # Head-safe extension: when the shoulders are confident but the head is
+        # not (a cyclist hunched over the bars, head low/forward/occluded), push
+        # the top up to make room for the head so the crop doesn't clip it.
+        cg = self.cfg.get("completeness_guard", {})
+        if bool(cg.get("head_extend", True)) and kp is not None:
+            def _conf(i: int) -> bool:
+                return i < len(kp) and float(kp[i][2]) > keypoint_conf
+            head_present = any(_conf(i) for i in (0, 1, 2, 3, 4))
+            if not head_present and _conf(5) and _conf(6):
+                sh_y = (float(kp[5][1]) + float(kp[6][1])) / 2.0
+                hips_y = [float(kp[i][1]) for i in (11, 12) if _conf(i)]
+                if hips_y and min(hips_y) > sh_y:            # torso length reference
+                    head_room = (min(hips_y) - sh_y) * float(cg.get("head_extend_ratio", 0.7))
+                else:                                        # fall back to shoulder width
+                    head_room = abs(float(kp[5][0]) - float(kp[6][0])) * float(cg.get("head_extend_ratio", 0.7))
+                y1 = min(y1, sh_y - head_room)
 
         runner_w = max(1.0, x2 - x1)
         runner_h = max(1.0, y2 - y1)
@@ -1889,6 +1967,30 @@ class HighResRunnerSuite:
                     is_full_frame=is_full_frame,
                 )
 
+                # Completeness guard: keep partial / head-truncated athletes out
+                # of Premium/Good. Soft by default (demote to Review); nothing is
+                # discarded unless review_on_partial is turned off.
+                cg = self.cfg.get("completeness_guard", {})
+                if bool(cg.get("enabled", True)) and not is_full_frame:
+                    comp = self._assess_completeness(kp, person_box, (h_img, w_img))
+                    details.update({
+                        "completeness": comp["completeness"],
+                        "has_upper_body": comp["has_upper_body"],
+                        "truncated_top": comp["truncated_top"],
+                    })
+                    if not comp["ok_for_premium"]:
+                        if bool(cg.get("review_on_partial", True)):
+                            if quality_class in ("premium", "good"):
+                                quality_class = "review"
+                                details["quality_class"] = "review"
+                                details["demoted_reason"] = comp["reason"]
+                                self._inc("demoted_partial")
+                        else:
+                            self._inc("truncated_frame" if comp["truncated_top"] else "partial_body")
+                            reject_path = self._save_reject_crop(img, crop_box, img_path, i, comp["reason"] or "partial_body")
+                            self._report({**base_row, "decision": "reject", "reason": comp["reason"] or "partial_body", **details, "reject_path": reject_path})
+                            continue
+
                 if not self._should_save_class(quality_class, score):
                     self._inc("low_quality_score")
                     reject_path = self._save_reject_crop(img, crop_box, img_path, i, "low_quality_score")
@@ -2357,7 +2459,8 @@ class HighResRunnerSuite:
             "total_images", "pre_check_rejected", "images_with_person", "processed_crops",
             "quality_premium", "quality_good", "quality_review", "fallback_saved",
             "no_person", "too_small", "unsafe_edge", "bad_pose", "blurred",
-            "fence_rejected", "low_quality_score", "crop_failed", "write_failed", "errors"
+            "fence_rejected", "low_quality_score", "crop_failed",
+            "demoted_partial", "partial_body", "truncated_frame", "write_failed", "errors"
         ]:
             print(f"{key:24s}: {self.stats.get(key, 0)}")
         if report_path is not None:
