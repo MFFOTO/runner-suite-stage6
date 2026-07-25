@@ -170,6 +170,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "review_on_partial": True,      # True = demote to Review; False = reject
         "head_extend": True,            # grow the crop up to include an occluded head
         "head_extend_ratio": 0.7,       # head room above shoulders, x torso length
+        "min_headroom_ratio": 0.12,     # margin kept above the crown when the head IS visible
+        "head_estimate_ratio": 0.22,    # min head allowance (x person height) when the head is weak
     },
     "fence_detection": {
         "enabled": True,
@@ -1360,21 +1362,29 @@ class HighResRunnerSuite:
             x2 = max(x2, float(np.max(valid[:, 0])))
             y2 = max(y2, float(np.max(valid[:, 1])))
 
-        # Head-safe extension: when the shoulders are confident but the head is
-        # not (a cyclist hunched over the bars, head low/forward/occluded), push
-        # the top up to make room for the head so the crop doesn't clip it.
+        # Head-safe framing. Two failure modes this guards against:
+        #  * hunched cyclists (head low/forward/occluded), and
+        #  * runners shot from a high vantage point -- looking down at the top of
+        #    the head means the face keypoints go low-confidence, so the box
+        #    stops at the neck and the head gets clipped.
+        # When the head keypoints ARE visible, keep a margin above the crown;
+        # when they're weak, estimate the head top above the shoulders (with a
+        # person-height floor so the estimate survives torso foreshortening).
         cg = self.cfg.get("completeness_guard", {})
         if bool(cg.get("head_extend", True)) and kp is not None:
             def _conf(i: int) -> bool:
                 return i < len(kp) and float(kp[i][2]) > keypoint_conf
-            head_present = any(_conf(i) for i in (0, 1, 2, 3, 4))
-            if not head_present and _conf(5) and _conf(6):
-                sh_y = (float(kp[5][1]) + float(kp[6][1])) / 2.0
-                hips_y = [float(kp[i][1]) for i in (11, 12) if _conf(i)]
-                if hips_y and min(hips_y) > sh_y:            # torso length reference
-                    head_room = (min(hips_y) - sh_y) * float(cg.get("head_extend_ratio", 0.7))
-                else:                                        # fall back to shoulder width
-                    head_room = abs(float(kp[5][0]) - float(kp[6][0])) * float(cg.get("head_extend_ratio", 0.7))
+            person_h = max(1.0, y2 - y1)
+            head_ys = [float(kp[i][1]) for i in (0, 1, 2, 3, 4) if _conf(i)]
+            shoulder_ys = [float(kp[i][1]) for i in (5, 6) if _conf(i)]
+            hip_ys = [float(kp[i][1]) for i in (11, 12) if _conf(i)]
+            if head_ys:                        # head visible -> margin above the crown
+                y1 = min(y1, min(head_ys) - person_h * float(cg.get("min_headroom_ratio", 0.12)))
+            elif shoulder_ys:                  # head weak -> estimate its top from shoulders
+                sh_y = sum(shoulder_ys) / len(shoulder_ys)
+                torso = (min(hip_ys) - sh_y) if hip_ys and min(hip_ys) > sh_y else 0.0
+                head_room = max(torso * float(cg.get("head_extend_ratio", 0.7)),
+                                person_h * float(cg.get("head_estimate_ratio", 0.22)))
                 y1 = min(y1, sh_y - head_room)
 
         runner_w = max(1.0, x2 - x1)
