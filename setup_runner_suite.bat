@@ -85,11 +85,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "yolov8m-pose.pt" (
-    echo.
-    echo [WARN] yolov8m-pose.pt liegt nicht im aktuellen Ordner.
-    echo Bitte die Datei in diesen Ordner kopieren oder settings.json anpassen.
-)
+rem Kein Modell-Check noetig: yolov8*-pose.pt wird beim ersten Lauf automatisch
+rem von ultralytics geladen (und .onnx bei Bedarf automatisch exportiert).
 
 echo.
 echo =======================================================

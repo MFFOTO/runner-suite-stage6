@@ -27,12 +27,8 @@ if not exist "settings.json" (
     exit /b 1
 )
 
-if not exist "yolov8m-pose.pt" (
-    echo [FEHLER] yolov8m-pose.pt wurde nicht gefunden.
-    echo Bitte die Modell-Datei in diesen Ordner legen oder settings.json anpassen.
-    pause
-    exit /b 1
-)
+rem Kein Modell-Check: die YOLO-Gewichte (yolov8*-pose.pt) werden bei Bedarf
+rem automatisch von ultralytics geladen, .onnx wird bei Bedarf exportiert.
 
 call ".venv\Scripts\activate.bat"
 rem Use the venv interpreter explicitly so a Store/global "python" on PATH
