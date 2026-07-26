@@ -1,7 +1,12 @@
-# Auto-downloaded model weights (fetched + hash-validated on first run)
+# Model weights -- never tracked. YOLO .pt files auto-download by name on first
+# run; .onnx are exported locally when a DirectML/onnx backend is used. Keeping
+# them out of git avoids pull conflicts with each machine's local copy and keeps
+# the repo small.
 *.pb
 *.pth
 *.part
+*.pt
+*.onnx
 
 # Python
 __pycache__/
