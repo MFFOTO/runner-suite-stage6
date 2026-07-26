@@ -813,9 +813,41 @@ class HighResRunnerSuite:
             ort._runner_suite_patched = True
         return accel
 
+    def _export_onnx_model(self, model_value: str, model_path: Path) -> Optional[Path]:
+        """Export a .onnx from the matching .pt (auto-downloaded by ultralytics)
+        so an ONNX/DirectML machine provisions itself on first run -- no manual
+        `yolo export` and no need to track the weights in git. Returns the
+        exported path, or None on failure (the caller then falls back)."""
+        try:
+            pt_local = model_path.with_suffix(".pt")
+            pt_source = str(pt_local) if pt_local.exists() else (Path(model_value).stem + ".pt")
+            imgsz = int(self.cfg["detector"].get("imgsz", 1024))
+            print(f"--- [HARDWARE] ONNX model '{model_value}' missing -- exporting from {pt_source} (imgsz={imgsz}) ... ---")
+            exported = YOLO(pt_source).export(format="onnx", imgsz=imgsz)
+            exported_path = Path(str(exported)) if exported else model_path.with_suffix(".onnx")
+            if exported_path.exists() and exported_path.resolve() != model_path.resolve():
+                ensure_dir(model_path.parent)
+                exported_path.replace(model_path)
+                exported_path = model_path
+            if exported_path.exists():
+                print(f"--- [HARDWARE] ONNX export complete -> {exported_path} ---")
+                return exported_path
+            print("[WARN] ONNX export did not produce a file; falling back to another backend.")
+            return None
+        except Exception as exc:
+            print(f"[WARN] ONNX auto-export failed ({exc}); falling back to another backend.")
+            return None
+
     def _setup_hardware_and_yolo(self):
         model_value = str(self.cfg["hardware"].get("model_path", "yolov8m-pose.pt"))
         model_path = self._resolve_path(model_value)
+        # Self-provision a missing ONNX model by exporting it from the matching
+        # .pt (mirrors the OpenVINO auto-export below), so DirectML machines need
+        # neither a git-tracked .onnx nor a manual export.
+        if model_value.lower().endswith(".onnx") and not model_path.exists():
+            exported = self._export_onnx_model(model_value, model_path)
+            if exported is not None:
+                model_path = exported
         if model_path.exists():
             model_arg = str(model_path)
         elif Path(model_value).name == model_value and not Path(model_value).is_absolute():
