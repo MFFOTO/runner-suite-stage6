@@ -157,14 +157,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # it; 0.5 would trim symmetrically (the old behaviour).
         "vertical_trim_top_fraction": 0.25,
         # Framing method:
-        #   "pad"     -> pad the detection box by fixed fractions, then fill the
-        #                aspect ratio (legacy; can push the runner up + add floor).
-        #   "anatomy" -> lock the vertical extent to head-top .. foot-bottom with
-        #                fixed margins and DERIVE the width from the aspect ratio.
-        #                Frames the runner head-to-toe at any vantage (low/center/
-        #                high) with no arbitrary floor. The pad_* values are unused
-        #                in this mode.
-        "mode": "pad",
+        #   "anatomy" -> (DEFAULT) lock the vertical extent to head-top .. foot-
+        #                bottom with fixed margins and DERIVE the width from the
+        #                aspect ratio. Frames the athlete head-to-toe at any
+        #                vantage (low/center/high) and any posture (runner or
+        #                hunched cyclist), with no arbitrary floor. pad_* unused.
+        #   "pad"     -> legacy: pad the box by fixed fractions, then fill the
+        #                aspect ratio vertically (can push the subject up, add
+        #                floor, and clip heads). Set this to revert per machine.
+        "mode": "anatomy",
         "anatomy_headroom_ratio": 0.08,     # sky kept above the crown (x person height)
         "anatomy_footroom_ratio": 0.06,     # ground kept below the feet
         "anatomy_crown_allowance": 0.06,    # crown height above the face keypoints
