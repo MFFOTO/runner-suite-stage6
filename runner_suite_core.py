@@ -618,13 +618,13 @@ class HighResRunnerSuite:
             # else: non-interactive auto run -> keep the computed suggestion
             self.cfg["performance"]["workers"] = workers
 
-        # Model tier: keep the accurate medium model wherever there's a capable
-        # GPU; step down to small on CPU-only or tiny-VRAM GPUs, and nano on ARM
-        # where compute is scarcest. Any unlisted/unknown hardware falls through
-        # to the small model as a safe middle ground. Smaller weights are
-        # auto-fetched by ultralytics on first use if not present locally.
+        # Model tier by VRAM: the accurate medium model on >=6 GB GPUs, the ~2x
+        # faster small model on smaller GPUs (e.g. 4 GB laptop cards) and CPU,
+        # and nano on ARM where compute is scarcest. Unknown VRAM (==0) is treated
+        # as small for safety. Smaller weights are auto-fetched by ultralytics on
+        # first use if not present locally.
         if cuda:
-            base_model = "yolov8m-pose.pt" if (vram >= 4 or vram == 0) else "yolov8s-pose.pt"
+            base_model = "yolov8m-pose.pt" if vram >= 6 else "yolov8s-pose.pt"
         elif is_arm:
             base_model = "yolov8n-pose.pt"
         else:
@@ -657,9 +657,10 @@ class HighResRunnerSuite:
             ("hardware", "model_path"): model_choice,
             ("hardware", "prefer_gpu"): cuda,
             ("hardware", "use_openvino_cpu"): (not cuda) and is_x86 and has_openvino,
-            # 1280 on GPU improves keypoint recall on hunched/occluded riders
-            # (fewer partial/cut-off detections); CPU/ARM stay lower for speed.
-            ("detector", "imgsz"): 1280 if cuda else (768 if is_x86 else 640),
+            # imgsz is VRAM-aware: 1280 on >=8 GB GPUs (better keypoint recall on
+            # hunched/occluded riders), 1024 on smaller GPUs so 4 GB laptop cards
+            # aren't crushed; CPU/ARM stay lower for speed.
+            ("detector", "imgsz"): (1280 if vram >= 8 else 1024) if cuda else (768 if is_x86 else 640),
             # Keep the validated single-image path by default; batching is an
             # opt-in lever (the profile below prints the VRAM-based suggestion).
             ("performance", "batch_size"): 1,
