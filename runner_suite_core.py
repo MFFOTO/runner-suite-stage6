@@ -160,6 +160,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "anatomy_footroom_ratio": 0.06,     # ground kept below the feet
         "anatomy_crown_allowance": 0.06,    # crown height above the face keypoints
         "anatomy_side_margin": 0.12,        # extra width beyond the runner when width-limited
+        # Foot-position fallback when ankle keypoints are missing/unconfident
+        # (common mid-stride: motion blur, self-occlusion). Estimated as a
+        # multiple of the shoulder-to-hip "torso" length (a stable per-person
+        # scale reference, unlike the box height which shrinks if the legs
+        # were dropped from the detection). Only used when a torso length
+        # can't be measured (no shoulder+hip keypoints); then it falls back to
+        # this fraction of the box height instead.
+        "anatomy_shank_to_torso_ratio": 0.75,   # knee -> ankle, relative to torso length
+        "anatomy_leg_to_torso_ratio": 1.55,     # hip -> ankle, relative to torso length
+        "anatomy_knee_extend_ratio": 0.20,      # knee -> ankle fallback, relative to box height
+        "anatomy_hip_extend_ratio": 0.45,       # hip -> ankle fallback, relative to box height
     },
     "completeness_guard": {
         # Keeps partial / cut-off athletes out of A_Premium / B_Good: a crop
@@ -169,6 +180,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # pose model returns a partial box (legs-only, or head clipped).
         "enabled": True,
         "require_upper_body": True,     # need a head OR both shoulders for A/B
+        "require_lower_body": True,     # need a hip OR a knee/ankle for A/B (catches head/torso-only crops)
         "truncation_guard": True,       # detect a head cut off by the frame top
         "edge_margin_px": 6,            # px from a border that counts as "touching"
         "review_on_partial": True,      # True = demote to Review; False = reject
@@ -1364,7 +1376,8 @@ class HighResRunnerSuite:
         has_hips = conf(11) or conf(12)
         has_legs = any(conf(i) for i in (13, 14, 15, 16))
         has_upper_body = has_head or both_shoulders
-        partial_lower_body = (has_hips or has_legs) and not has_upper_body
+        has_lower_body = has_hips or has_legs
+        partial_lower_body = has_lower_body and not has_upper_body
 
         zones = [has_head, any_shoulder, has_hips, conf(13) or conf(14), conf(15) or conf(16)]
         completeness = sum(1 for z in zones if z) / float(len(zones))
@@ -1374,7 +1387,11 @@ class HighResRunnerSuite:
         truncated_top = bool(cg.get("truncation_guard", True)) and (y1 <= margin) and not has_head
         truncated_bottom = (y2 >= h_img - margin) and not has_legs  # informational (feet cut is OK)
 
-        demote = (bool(cg.get("require_upper_body", True)) and not has_upper_body) or truncated_top
+        demote = (
+            (bool(cg.get("require_upper_body", True)) and not has_upper_body)
+            or (bool(cg.get("require_lower_body", True)) and not has_lower_body)
+            or truncated_top
+        )
         reason = None
         if partial_lower_body:
             reason = "partial_lower_body"
@@ -1382,9 +1399,11 @@ class HighResRunnerSuite:
             reason = "truncated_head"
         elif not has_upper_body:
             reason = "no_upper_body"
+        elif not has_lower_body:
+            reason = "no_lower_body"
         return {
             "has_head": has_head, "has_upper_body": has_upper_body,
-            "partial_lower_body": partial_lower_body,
+            "has_lower_body": has_lower_body, "partial_lower_body": partial_lower_body,
             "truncated_top": truncated_top, "truncated_bottom": truncated_bottom,
             "completeness": round(completeness, 3),
             "ok_for_premium": not demote, "reason": reason,
@@ -1406,6 +1425,8 @@ class HighResRunnerSuite:
 
         head_ys = [float(kp[i][1]) for i in (0, 1, 2, 3, 4) if _conf(i)]
         shoulder_ys = [float(kp[i][1]) for i in (5, 6) if _conf(i)]
+        hip_ys = [float(kp[i][1]) for i in (11, 12) if _conf(i)]
+        knee_ys = [float(kp[i][1]) for i in (13, 14) if _conf(i)]
         ankle_ys = [float(kp[i][1]) for i in (15, 16) if _conf(i)]
 
         # Head-top: the crown sits above the face keypoints; when the head is weak
@@ -1416,7 +1437,33 @@ class HighResRunnerSuite:
             head_top = min(by1, (sum(shoulder_ys) / len(shoulder_ys)) - ph * float(cg.get("head_estimate_ratio", 0.22)))
         else:
             head_top = by1
-        foot_bottom = max([by2] + ankle_ys)
+
+        # Foot-bottom: prefer the ankles; when they're missing/unconfident
+        # (motion blur mid-stride, self-occlusion), estimate below the lowest
+        # visible leg joint instead of trusting the raw box bottom, which is
+        # often truncated at the knee/hip rather than the actual foot. Scale
+        # the estimate by the shoulder-to-hip "torso" length -- a per-person
+        # reference that doesn't shrink just because the legs were dropped
+        # from the box -- falling back to a fraction of the box height only
+        # when no torso length can be measured either.
+        torso = None
+        if shoulder_ys and hip_ys:
+            sh_y = sum(shoulder_ys) / len(shoulder_ys)
+            hip_y = sum(hip_ys) / len(hip_ys)
+            if hip_y > sh_y:
+                torso = hip_y - sh_y
+        if ankle_ys:
+            foot_bottom = max([by2] + ankle_ys)
+        elif knee_ys:
+            shank = torso * float(cp.get("anatomy_shank_to_torso_ratio", 0.75)) if torso \
+                else ph * float(cp.get("anatomy_knee_extend_ratio", 0.20))
+            foot_bottom = max(by2, max(knee_ys) + shank)
+        elif hip_ys:
+            leg = torso * float(cp.get("anatomy_leg_to_torso_ratio", 1.55)) if torso \
+                else ph * float(cp.get("anatomy_hip_extend_ratio", 0.45))
+            foot_bottom = max(by2, max(hip_ys) + leg)
+        else:
+            foot_bottom = by2
 
         person_h = max(1.0, foot_bottom - head_top)
         top = head_top - person_h * float(cp.get("anatomy_headroom_ratio", 0.08))
