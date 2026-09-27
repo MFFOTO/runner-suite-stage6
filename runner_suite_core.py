@@ -146,26 +146,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "crop": {
         "aspect_ratio": 0.666,
-        "pad_x": 0.38,
-        "pad_top": 0.18,
-        "pad_bottom": 0.28,
-        "small_person_threshold_px": 700,
-        "small_person_extra_pad_multiplier": 1.15,
         # When resize_final has to trim height to hit the target aspect ratio,
         # this is the fraction of the excess removed from the TOP (the rest from
         # the bottom). 0.25 keeps the head in the upper third instead of clipping
         # it; 0.5 would trim symmetrically (the old behaviour).
         "vertical_trim_top_fraction": 0.25,
-        # Framing method:
-        #   "anatomy" -> (DEFAULT) lock the vertical extent to head-top .. foot-
-        #                bottom with fixed margins and DERIVE the width from the
-        #                aspect ratio. Frames the athlete head-to-toe at any
-        #                vantage (low/center/high) and any posture (runner or
-        #                hunched cyclist), with no arbitrary floor. pad_* unused.
-        #   "pad"     -> legacy: pad the box by fixed fractions, then fill the
-        #                aspect ratio vertically (can push the subject up, add
-        #                floor, and clip heads). Set this to revert per machine.
-        "mode": "anatomy",
+        # Anatomy-anchored framing: lock the vertical extent to head-top ..
+        # foot-bottom with fixed margins and DERIVE the width from the aspect
+        # ratio. Frames the athlete head-to-toe at any vantage (low/center/
+        # high) and any posture (runner or hunched cyclist), with no
+        # arbitrary floor.
         "anatomy_headroom_ratio": 0.08,     # sky kept above the crown (x person height)
         "anatomy_footroom_ratio": 0.06,     # ground kept below the feet
         "anatomy_crown_allowance": 0.06,    # crown height above the face keypoints
@@ -182,9 +172,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "truncation_guard": True,       # detect a head cut off by the frame top
         "edge_margin_px": 6,            # px from a border that counts as "touching"
         "review_on_partial": True,      # True = demote to Review; False = reject
-        "head_extend": True,            # grow the crop up to include an occluded head
-        "head_extend_ratio": 0.7,       # head room above shoulders, x torso length
-        "min_headroom_ratio": 0.12,     # margin kept above the crown when the head IS visible
         "head_estimate_ratio": 0.22,    # min head allowance (x person height) when the head is weak
     },
     "fence_detection": {
@@ -1008,7 +995,7 @@ class HighResRunnerSuite:
                 scale=4,
                 model_path=str(model_path),
                 model=net,
-                tile=int(iq.get("realesrgan_tile", 0)),
+                tile=int(iq.get("realesrgan_tile", 256)),
                 tile_pad=10,
                 pre_pad=0,
                 half=True,
@@ -1457,94 +1444,15 @@ class HighResRunnerSuite:
             x2 = max(x2, float(np.max(valid[:, 0])))
             y2 = max(y2, float(np.max(valid[:, 1])))
 
-        # Anatomy-anchored framing (opt-in via crop.mode="anatomy"). Uses a plain
-        # clip (not the shift-to-fit below) so a head near the source top is not
-        # pushed downward into a floor of empty ground; resize_final does any
-        # final aspect correction, bottom-biased and head-safe.
-        if str(cp.get("mode", "pad")).lower() == "anatomy":
-            ax1, ay1, ax2, ay2 = self._anatomy_crop_box(kp, (x1, y1, x2, y2), keypoint_conf, cp)
-            x1i = int(clamp(ax1, 0, w_img - 1))
-            y1i = int(clamp(ay1, 0, h_img - 1))
-            x2i = int(clamp(ax2, x1i + 1, w_img))
-            y2i = int(clamp(ay2, y1i + 1, h_img))
-            crop = img[y1i:y2i, x1i:x2i]
-            if crop is None or crop.size == 0:
-                return None
-            return crop, (float(x1i), float(y1i), float(x2i), float(y2i))
-
-        # Head-safe framing. Two failure modes this guards against:
-        #  * hunched cyclists (head low/forward/occluded), and
-        #  * runners shot from a high vantage point -- looking down at the top of
-        #    the head means the face keypoints go low-confidence, so the box
-        #    stops at the neck and the head gets clipped.
-        # When the head keypoints ARE visible, keep a margin above the crown;
-        # when they're weak, estimate the head top above the shoulders (with a
-        # person-height floor so the estimate survives torso foreshortening).
-        cg = self.cfg.get("completeness_guard", {})
-        if bool(cg.get("head_extend", True)) and kp is not None:
-            def _conf(i: int) -> bool:
-                return i < len(kp) and float(kp[i][2]) > keypoint_conf
-            person_h = max(1.0, y2 - y1)
-            head_ys = [float(kp[i][1]) for i in (0, 1, 2, 3, 4) if _conf(i)]
-            shoulder_ys = [float(kp[i][1]) for i in (5, 6) if _conf(i)]
-            hip_ys = [float(kp[i][1]) for i in (11, 12) if _conf(i)]
-            if head_ys:                        # head visible -> margin above the crown
-                y1 = min(y1, min(head_ys) - person_h * float(cg.get("min_headroom_ratio", 0.12)))
-            elif shoulder_ys:                  # head weak -> estimate its top from shoulders
-                sh_y = sum(shoulder_ys) / len(shoulder_ys)
-                torso = (min(hip_ys) - sh_y) if hip_ys and min(hip_ys) > sh_y else 0.0
-                head_room = max(torso * float(cg.get("head_extend_ratio", 0.7)),
-                                person_h * float(cg.get("head_estimate_ratio", 0.22)))
-                y1 = min(y1, sh_y - head_room)
-
-        runner_w = max(1.0, x2 - x1)
-        runner_h = max(1.0, y2 - y1)
-        pad_mult = 1.0
-        if runner_h < float(cp.get("small_person_threshold_px", 700)):
-            pad_mult = float(cp.get("small_person_extra_pad_multiplier", 1.15))
-
-        x1 -= runner_w * float(cp.get("pad_x", 0.38)) * pad_mult
-        x2 += runner_w * float(cp.get("pad_x", 0.38)) * pad_mult
-        y1 -= runner_h * float(cp.get("pad_top", 0.18)) * pad_mult
-        y2 += runner_h * float(cp.get("pad_bottom", 0.28)) * pad_mult
-
-        target_ratio = float(cp.get("aspect_ratio", 0.666))
-        crop_w = max(1.0, x2 - x1)
-        crop_h = max(1.0, y2 - y1)
-        if crop_w / crop_h < target_ratio:
-            extra = crop_h * target_ratio - crop_w
-            x1 -= extra / 2.0
-            x2 += extra / 2.0
-        else:
-            extra = crop_w / target_ratio - crop_h
-            y1 -= extra * 0.45
-            y2 += extra * 0.55
-
-        crop_w = x2 - x1
-        crop_h = y2 - y1
-        if crop_w >= w_img:
-            x1, x2 = 0.0, float(w_img)
-        else:
-            if x1 < 0:
-                x2 -= x1
-                x1 = 0.0
-            if x2 > w_img:
-                x1 -= (x2 - w_img)
-                x2 = float(w_img)
-        if crop_h >= h_img:
-            y1, y2 = 0.0, float(h_img)
-        else:
-            if y1 < 0:
-                y2 -= y1
-                y1 = 0.0
-            if y2 > h_img:
-                y1 -= (y2 - h_img)
-                y2 = float(h_img)
-
-        x1i = int(clamp(x1, 0, w_img - 1))
-        y1i = int(clamp(y1, 0, h_img - 1))
-        x2i = int(clamp(x2, x1i + 1, w_img))
-        y2i = int(clamp(y2, y1i + 1, h_img))
+        # Anatomy-anchored framing. Uses a plain clip (not a shift-to-fit) so a
+        # head near the source top is not pushed downward into a floor of
+        # empty ground; resize_final does any final aspect correction,
+        # bottom-biased and head-safe.
+        ax1, ay1, ax2, ay2 = self._anatomy_crop_box(kp, (x1, y1, x2, y2), keypoint_conf, cp)
+        x1i = int(clamp(ax1, 0, w_img - 1))
+        y1i = int(clamp(ay1, 0, h_img - 1))
+        x2i = int(clamp(ax2, x1i + 1, w_img))
+        y2i = int(clamp(ay2, y1i + 1, h_img))
         crop = img[y1i:y2i, x1i:x2i]
         if crop is None or crop.size == 0:
             return None
@@ -1688,7 +1596,7 @@ class HighResRunnerSuite:
         classes = qs.get("classes", {})
         if score >= float(classes.get("premium", 73)):
             return "premium"
-        if score >= float(classes.get("good", 65)):
+        if score >= float(classes.get("good", 60)):
             return "good"
         if score >= float(classes.get("review", 45)):
             return "review"
@@ -2458,7 +2366,7 @@ class HighResRunnerSuite:
 
     def _maybe_offer_review_enhancement(self) -> None:
         re_cfg = self.cfg.get("review_enhancement", {})
-        if not bool(re_cfg.get("enabled", True)) or not bool(re_cfg.get("prompt_after_run", True)):
+        if not bool(re_cfg.get("enabled", False)) or not bool(re_cfg.get("prompt_after_run", True)):
             return
         review_folder = self.output_folder / self._quality_folder_name("review")
         if not review_folder.exists() or not any(
