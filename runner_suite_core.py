@@ -119,7 +119,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "show_cuda_check": True,
     },
     "detector": {
-        "imgsz": 1024,
+        "imgsz": 1536,
         "iou": 0.55,
         "max_det": 120,
     },
@@ -1384,7 +1384,14 @@ class HighResRunnerSuite:
 
         margin = float(cg.get("edge_margin_px", 6))
         y1, y2 = float(person_box[1]), float(person_box[3])
-        truncated_top = bool(cg.get("truncation_guard", True)) and (y1 <= margin) and not has_head
+        # A box touching the frame's top edge means the detector's own box was
+        # cut off there -- the person's true extent very likely continues
+        # beyond the photo. This holds even when eyes/nose are confidently
+        # detected: those keypoints sit on the face, well below the crown, so
+        # a photo can clip someone's hair/crown while their face keypoints
+        # stay fully visible and confident (has_head=True). Only the box edge
+        # itself reliably signals that.
+        truncated_top = bool(cg.get("truncation_guard", True)) and (y1 <= margin)
         truncated_bottom = (y2 >= h_img - margin) and not has_legs  # informational (feet cut is OK)
 
         demote = (
