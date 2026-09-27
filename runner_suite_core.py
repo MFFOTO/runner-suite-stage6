@@ -1028,25 +1028,11 @@ class HighResRunnerSuite:
         if not url:
             print(f"[WARN] Real-ESRGAN model missing at {model_path} and no URL configured.")
             return False
-        print(f"[AI PIXELS] Real-ESRGAN model not found -- downloading weights to {model_path} ...")
-        tmp_path = model_path.with_name(model_path.name + ".part")
-        try:
-            import urllib.request
-            ensure_dir(model_path.parent)
-            urllib.request.urlretrieve(url, str(tmp_path))
-        except Exception as exc:
-            self._unlink_quietly(tmp_path)
-            print(f"[WARN] Could not download Real-ESRGAN model: {exc}")
-            return False
         expected_sha = str(iq.get("realesrgan_model_sha256", "")).strip().lower()
-        ok, reason = self._validate_model_download(tmp_path, expected_sha, min_bytes=1_000_000)
-        if not ok:
-            self._unlink_quietly(tmp_path)
-            print(f"[WARN] Downloaded Real-ESRGAN model failed validation ({reason}). Discarding it.")
-            return False
-        tmp_path.replace(model_path)
-        print("[AI PIXELS] Real-ESRGAN model download complete (validated).")
-        return True
+        return self._download_and_validate_model(
+            url, model_path, label="Real-ESRGAN model", log_prefix="AI PIXELS",
+            min_bytes=1_000_000, expected_sha256=expected_sha, show_manual_instructions=False,
+        )
 
     def _apply_upscaler(self, crop: Any) -> Any:
         """Super-resolve a small crop. Prefers Real-ESRGAN (GPU, ENHANCER) when
@@ -1129,9 +1115,30 @@ class HighResRunnerSuite:
         if not url:
             print(f"[WARN] FSRCNN model missing at {model_path} and no download URL is configured.")
             return False
-        print(f"[AI PIXELS] FSRCNN model not found -- downloading weights to {model_path} ...")
-        # Download to a temp file first; only promote it to the real path once it
-        # passes validation, so a partial/corrupt fetch never lands as the .pb.
+        expected_sha = str(iq.get("fsrcnn_model_sha256", "")).strip().lower()
+        return self._download_and_validate_model(
+            url, model_path, label="FSRCNN model", log_prefix="AI PIXELS",
+            expected_sha256=expected_sha,
+        )
+
+    def _download_and_validate_model(
+        self,
+        url: str,
+        model_path: Path,
+        *,
+        label: str,
+        log_prefix: str = "AI PIXELS",
+        min_bytes: int = 1024,
+        expected_sha256: str = "",
+        show_manual_instructions: bool = True,
+    ) -> bool:
+        """Shared download path for every auto-fetched model weight file
+        (FSRCNN / Real-ESRGAN / GFPGAN): fetch to a '.part' temp file, sanity-
+        check it (size / HTML-page / optional SHA-256 via
+        _validate_model_download), and only then promote it to model_path. A
+        partial or corrupt download is discarded rather than left in place.
+        Returns True once a valid file sits at model_path."""
+        print(f"[{log_prefix}] {label} not found -- downloading weights to {model_path} ...")
         tmp_path = model_path.with_name(model_path.name + ".part")
         try:
             import urllib.request
@@ -1139,22 +1146,23 @@ class HighResRunnerSuite:
             urllib.request.urlretrieve(url, str(tmp_path))
         except Exception as exc:
             self._unlink_quietly(tmp_path)
-            print(f"[WARN] Could not download FSRCNN model automatically: {exc}")
-            print(f"       Please download it manually from {url}")
-            print(f"       and place it at: {model_path}")
+            print(f"[WARN] Could not download {label}: {exc}")
+            if show_manual_instructions:
+                print(f"       Please download it manually from {url}")
+                print(f"       and place it at: {model_path}")
             return False
 
-        expected_sha = str(iq.get("fsrcnn_model_sha256", "")).strip().lower()
-        ok, reason = self._validate_model_download(tmp_path, expected_sha)
+        ok, reason = self._validate_model_download(tmp_path, expected_sha256, min_bytes=min_bytes)
         if not ok:
             self._unlink_quietly(tmp_path)
-            print(f"[WARN] Downloaded FSRCNN model failed validation ({reason}). Discarding it.")
-            print(f"       Please download it manually from {url}")
-            print(f"       and place it at: {model_path}")
+            print(f"[WARN] Downloaded {label} failed validation ({reason}). Discarding it.")
+            if show_manual_instructions:
+                print(f"       Please download it manually from {url}")
+                print(f"       and place it at: {model_path}")
             return False
 
         tmp_path.replace(model_path)
-        print("[AI PIXELS] FSRCNN model download complete (validated).")
+        print(f"[{log_prefix}] {label} download complete (validated).")
         return True
 
     @staticmethod
@@ -1580,11 +1588,10 @@ class HighResRunnerSuite:
         vertical = cv2.morphologyEx(bright, cv2.MORPH_OPEN, kernel)
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(vertical, connectivity=8)
 
-        component_mask = np.zeros_like(vertical)
-        vertical_count = 0
         min_comp_h = h * float(cfg.get("min_component_height_ratio", 0.32))
         max_comp_w = max(3.0, w * float(cfg.get("max_component_width_ratio", 0.11)))
         min_aspect = float(cfg.get("min_component_aspect_ratio", 3.0))
+        valid_labels = []
         for label in range(1, num_labels):
             cw = stats[label, cv2.CC_STAT_WIDTH]
             ch = stats[label, cv2.CC_STAT_HEIGHT]
@@ -1594,8 +1601,15 @@ class HighResRunnerSuite:
                 continue
             if ch / max(1.0, cw) < min_aspect:
                 continue
-            component_mask[labels == label] = 255
-            vertical_count += 1
+            valid_labels.append(label)
+        vertical_count = len(valid_labels)
+        # Single np.isin pass over the whole label map instead of one
+        # `labels == label` full-image comparison per accepted component
+        # (O(h*w) total instead of O(num_labels * h*w)).
+        if valid_labels:
+            component_mask = np.isin(labels, valid_labels).astype(np.uint8) * 255
+        else:
+            component_mask = np.zeros_like(vertical)
 
         vertical_line_coverage = float(np.count_nonzero(component_mask)) / float(max(1, w * h))
         rel_person = self._relative_box(person_box, crop_box, w, h)
@@ -2320,35 +2334,14 @@ class HighResRunnerSuite:
             if not url:
                 print(f"[WARN] GFPGAN model missing at {model_path} and no download URL is configured.")
                 return False
-            print(f"[AI ENHANCE] Downloading face-restoration model weights to {model_path} ...")
-            # Download to a temp file and validate before promoting it, so a
-            # partial/corrupt fetch (or an HTML error page) is never saved as
-            # the .pth and then handed to GFPGAN.
-            tmp_path = model_path.with_name(model_path.name + ".part")
-            try:
-                import urllib.request
-                ensure_dir(model_path.parent)
-                urllib.request.urlretrieve(url, str(tmp_path))
-            except Exception as exc:
-                self._unlink_quietly(tmp_path)
-                print(f"[WARN] Could not download GFPGAN model automatically: {exc}")
-                print(f"       Please download it manually from {url}")
-                print(f"       and place it at: {model_path}")
-                return False
-
             expected_sha = str(re_cfg.get("gfpgan_model_sha256", "")).strip().lower()
             # The .pth is a few hundred MB; a 1 MB floor catches truncated
             # fetches / error pages without risking a false reject.
-            ok, reason = self._validate_model_download(tmp_path, expected_sha, min_bytes=1_000_000)
-            if not ok:
-                self._unlink_quietly(tmp_path)
-                print(f"[WARN] Downloaded GFPGAN model failed validation ({reason}). Discarding it.")
-                print(f"       Please download it manually from {url}")
-                print(f"       and place it at: {model_path}")
+            if not self._download_and_validate_model(
+                url, model_path, label="GFPGAN model", log_prefix="AI ENHANCE",
+                min_bytes=1_000_000, expected_sha256=expected_sha,
+            ):
                 return False
-
-            tmp_path.replace(model_path)
-            print("[AI ENHANCE] Model download complete (validated).")
 
         return True
 
