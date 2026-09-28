@@ -398,8 +398,27 @@ class HighResRunnerSuite:
     # Setup
     # ------------------------------------------------------------------
     def _resolve_path(self, path_value: str) -> Path:
+        raw = path_value
+        path_value = path_value.strip()
         p = Path(path_value)
-        return p if p.is_absolute() else self.base_dir / p
+        if p.is_absolute():
+            return p
+        if p.drive and not p.root:
+            # Windows "drive-relative" path (e.g. "D:Crops", missing the
+            # separator after the drive letter) -- Path.is_absolute() is
+            # False for these, so the code below would silently glue it onto
+            # base_dir (e.g. "D:\suite\D:Crops"), which then fails with a
+            # cryptic WinError 123 at mkdir time. A stray leading space
+            # before the drive letter (" D:\Crops") triggers the same thing,
+            # since it hides the drive from Path's parser entirely. Fail
+            # loudly here instead, with a message that names the actual cause.
+            raise ValueError(
+                f"Config path {raw!r} looks like a Windows drive without a "
+                f"separator after it (e.g. 'D:Crops' instead of 'D:/Crops' or "
+                f"'D:\\Crops'), or has leading/trailing whitespace hiding the "
+                f"drive letter. Fix the path in settings.json."
+            )
+        return self.base_dir / p
 
     def _load_config(self, path: Path) -> Dict[str, Any]:
         if not path.exists():
