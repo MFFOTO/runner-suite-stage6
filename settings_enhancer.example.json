@@ -27,6 +27,8 @@
     "min_keypoints": 4,
     "require_frontal_face": false,
     "min_sharpness_threshold": 80,
+    "sharpness_metric": "subject",
+    "premium_min_sharpness": 180,
     "hard_reject_fence": true,
     "hard_reject_extreme_blur": true
   },
@@ -87,12 +89,12 @@
     "realesrgan_model_path": "RealESRGAN_x4plus.pth",
     "realesrgan_model_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
     "realesrgan_model_sha256": "",
-    "realesrgan_tile": 400,
+    "realesrgan_tile": "auto",
     "realesrgan_auto_install": true,
     "enhance_by_class": {
       "premium": "none",
       "good": "upscale",
-      "review": "upscale+face"
+      "review": "none"
     },
     "sharpening": "medium",
     "denoise": false,
@@ -108,7 +110,7 @@
       "good": 65,
       "review": 45
     },
-    "excellent_sharpness": 300,
+    "excellent_sharpness": 350,
     "ideal_runner_height_px": 700,
     "ideal_confidence": 0.65,
     "weights": {

@@ -84,6 +84,14 @@ except Exception:
 # Not required to run the suite -- if missing, enhancement falls back to a
 # simpler upscale/contrast/sharpen pipeline using only OpenCV.
 try:
+    # basicsr (imported by gfpgan/realesrgan) needs torchvision's removed
+    # transforms.functional_tensor module; alias it before importing them.
+    import torchvision.transforms.functional as _tvf  # type: ignore
+    sys.modules.setdefault("torchvision.transforms.functional_tensor", _tvf)
+except Exception:
+    pass
+
+try:
     from gfpgan import GFPGANer  # type: ignore
 except Exception:
     GFPGANer = None  # type: ignore
@@ -133,6 +141,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_keypoints": 4,
         "require_frontal_face": False,
         "min_sharpness_threshold": 80,
+        # "subject": focus measured on the athlete's head/torso only, normalised
+        # to a fixed size (ignores fence/spectators/sensor noise; tracks visible
+        # softness far better). "box": legacy Laplacian variance of the whole
+        # person box at native resolution. Thresholds are on this metric
+        # (subject scale: min ~80, premium_min ~180, excellent ~350).
+        "sharpness_metric": "subject",
+        # A crop scoring Premium but softer than this is demoted to Good. 0 = off.
+        "premium_min_sharpness": 180,
         "hard_reject_fence": True,
         "hard_reject_extreme_blur": True,
     },
@@ -253,13 +269,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "realesrgan_model_path": "RealESRGAN_x4plus.pth",
         "realesrgan_model_url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
         "realesrgan_model_sha256": "",
-        "realesrgan_tile": 256,
+        # Tile size for Real-ESRGAN. 0 = no tiling (fastest, no seams, needs VRAM);
+        # "auto" = 0 on GPUs with >= 10 GB, else 256. Falls back to 256 by itself
+        # if an untiled run runs out of memory.
+        "realesrgan_tile": "auto",
         "realesrgan_auto_install": True,
         # Per-quality-class enhancement. Modes: "none" (Lanczos only),
         # "upscale" (Real-ESRGAN/FSRCNN), "upscale+face" (Real-ESRGAN + GFPGAN
-        # face restoration). Default: same "upscale" for every class (the fast
-        # suite's behaviour); the ENHANCER preset overrides per class.
-        "enhance_by_class": {"premium": "upscale", "good": "upscale", "review": "upscale"},
+        # face restoration). Default: "upscale" for Premium/Good, nothing for Review
+        # (not worth the GPU time); the ENHANCER preset overrides per class.
+        "enhance_by_class": {"premium": "upscale", "good": "upscale", "review": "none"},
         "sharpening": "strong",
         "denoise": False,
         # Premium crops are selected for already being sharp, so the global
@@ -279,7 +298,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "good": 60,
             "review": 45,
         },
-        "excellent_sharpness": 300,
+        "excellent_sharpness": 350,
         "ideal_runner_height_px": 700,
         "ideal_confidence": 0.65,
         "weights": {
@@ -358,6 +377,7 @@ class HighResRunnerSuite:
             "partial_body": 0,
             "truncated_frame": 0,
             "demoted_partial": 0,
+            "demoted_soft": 0,
             "fallback_saved": 0,
             "write_failed": 0,
             "errors": 0,
@@ -902,7 +922,11 @@ class HighResRunnerSuite:
                 if torch.cuda.is_available():
                     self.device_mode = "cuda:0"
                     self.backend = "pytorch"
-                    torch.backends.cudnn.benchmark = True
+                    # benchmark=True re-tunes cuDNN for every new input shape
+                    # (~13 s each on an RTX 50-series) -- and our shapes vary
+                    # (letterbox size, Real-ESRGAN crop sizes) -- for no
+                    # measurable gain at inference.
+                    torch.backends.cudnn.benchmark = False
                     print("--- [HARDWARE] NVIDIA GPU/CUDA active ---")
                     return self._apply_fuse_guard(YOLO(model_arg))
             except Exception as exc:
@@ -1011,7 +1035,7 @@ class HighResRunnerSuite:
                 return
             print("[AI PIXELS] Installing realesrgan + basicsr (one-time, can take a few minutes) ...")
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "realesrgan", "basicsr"])
+                self._install_enhancer_deps()
                 RealESRGANer, RRDBNet = _import_realesrgan()
             except Exception as exc2:
                 print(f"[WARN] Could not install/import realesrgan ({exc2}); using FSRCNN/Lanczos.")
@@ -1022,21 +1046,41 @@ class HighResRunnerSuite:
             return
         try:
             net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+            tile_cfg = iq.get("realesrgan_tile", "auto")
+            if isinstance(tile_cfg, str) and tile_cfg.strip().lower() == "auto":
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                tile = 0 if vram_gb >= 10 else 256
+            else:
+                tile = int(tile_cfg)
             self._realesrgan = RealESRGANer(
                 scale=4,
                 model_path=str(model_path),
                 model=net,
-                tile=int(iq.get("realesrgan_tile", 256)),
+                tile=tile,
                 tile_pad=10,
                 pre_pad=0,
                 half=True,
                 device="cuda",
             )
             self._realesrgan_scale = 4
-            print("--- [AI PIXELS] Real-ESRGAN x4 loaded (GPU) ---")
+            # channels_last (NHWC) is the layout the FP16 Tensor Cores want for
+            # convolutions; with NCHW cuDNN has to reorder tensors around every
+            # conv. Same results, less overhead. conv picks the layout from the
+            # weights, so converting the model is enough.
+            try:
+                self._realesrgan.model = self._realesrgan.model.to(memory_format=torch.channels_last)
+            except Exception as exc:
+                print(f"[WARN] channels_last not applied to Real-ESRGAN: {exc}")
+            tile_txt = "untiled" if tile == 0 else f"tile {tile}"
+            print(f"--- [AI PIXELS] Real-ESRGAN x4 loaded (GPU, {tile_txt}, channels_last) ---")
         except Exception as exc:
             print(f"[WARN] Real-ESRGAN could not be loaded: {exc}; using FSRCNN/Lanczos.")
             self._realesrgan = None
+
+    def _install_enhancer_deps(self) -> None:
+        """Install basicsr/realesrgan/gfpgan/facexlib via install_enhancer_deps.py
+        (patched basicsr for Python 3.13+, single OpenCV build). Raises on failure."""
+        subprocess.check_call([sys.executable, str(self.base_dir / "install_enhancer_deps.py")])
 
     def _download_realesrgan_model(self, model_path: Path) -> bool:
         """Auto-download the Real-ESRGAN weights (mirrors the FSRCNN/GFPGAN
@@ -1061,8 +1105,19 @@ class HighResRunnerSuite:
                 with self._realesrgan_lock:
                     # Real-ESRGAN prints a line per tile ("Tile 9/24"); swallow
                     # that so it doesn't bury the progress bar.
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        out, _ = self._realesrgan.enhance(crop, outscale=self._realesrgan_scale)
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            out, _ = self._realesrgan.enhance(crop, outscale=self._realesrgan_scale)
+                    except RuntimeError as exc:
+                        # Untiled run out of VRAM -> switch to tiling for good and retry.
+                        if "out of memory" not in str(exc).lower() or self._realesrgan.tile_size:
+                            raise
+                        import torch  # type: ignore
+                        torch.cuda.empty_cache()
+                        self._realesrgan.tile_size = 256
+                        print("[WARN] Real-ESRGAN ran out of VRAM untiled -- switching to tile 256.")
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            out, _ = self._realesrgan.enhance(crop, outscale=self._realesrgan_scale)
                 return out
             except Exception as exc:
                 print(f"[WARN] Real-ESRGAN upscaling skipped: {exc}")
@@ -1269,6 +1324,42 @@ class HighResRunnerSuite:
             return 0.0
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def get_subject_sharpness(self, img: Any, kp: Any, person_box: Box, norm_height: int = 480) -> float:
+        """Focus measure for the athlete only: Laplacian variance of the head/
+        shoulders/hips region (keypoints), normalised to a fixed height so it is
+        independent of frame size and sensor noise. The whole person box also
+        contains fence, spectators and background, which skew the plain score."""
+        h_img, w_img = img.shape[:2]
+        x1, y1, x2, y2 = [float(v) for v in person_box]
+        region = None
+        if kp is not None:
+            kc = float(self.cfg["selection_filters"].get("keypoint_conf", 0.30))
+            pts = [kp[i] for i in (0, 1, 2, 5, 6, 11, 12) if i < len(kp) and float(kp[i][2]) > kc]
+            if len(pts) >= 3:
+                xs = [float(p[0]) for p in pts]
+                ys = [float(p[1]) for p in pts]
+                bw = max(xs) - min(xs)
+                bh = max(ys) - min(ys)
+                pad_x, pad_y = max(bw * 0.05, 0.02 * (y2 - y1)), max(bh * 0.08, 0.02 * (y2 - y1))
+                region = (min(xs) - pad_x, min(ys) - pad_y, max(xs) + pad_x, max(ys) + pad_y)
+        if region is None:
+            region = (x1, y1, x2, y1 + (y2 - y1) * 0.65)
+        roi = self._extract_roi(img, region)
+        if roi is None or roi.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        if gray.shape[0] > norm_height:
+            scale = norm_height / float(gray.shape[0])
+            gray = cv2.resize(gray, (max(1, int(round(gray.shape[1] * scale))), norm_height), interpolation=cv2.INTER_AREA)
+        full = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        # Take the smaller of whole-region and central-half focus: foliage, fence
+        # or crowd texture at the edges of the region can't inflate the score.
+        gw = gray.shape[1]
+        central = gray[:, gw // 4: gw - gw // 4]
+        if central.size == 0:
+            return full
+        return min(full, float(cv2.Laplacian(central, cv2.CV_64F).var()))
 
     def get_brightness_score(self, image: Any) -> float:
         """Mean grayscale brightness (0-255)."""
@@ -2063,7 +2154,10 @@ class HighResRunnerSuite:
                 # Sharpness first — cheaper than fence detection (no morphological ops),
                 # so blurry crops are rejected before the more expensive fence check runs.
                 sharp_roi = crop if is_full_frame else self._extract_roi(img, person_box)
-                sharpness = self.get_sharpness_score(sharp_roi)
+                sharpness_box = self.get_sharpness_score(sharp_roi)
+                sharp_subject = self.get_subject_sharpness(img, kp, person_box)
+                use_subject = str(sf.get("sharpness_metric", "subject")).lower() == "subject"
+                sharpness = sharp_subject if use_subject else sharpness_box
                 if bool(sf.get("hard_reject_extreme_blur", True)) and sharpness < min_sharp:
                     self._inc("blurred")
                     reject_path = self._save_reject_crop(img, crop_box, img_path, i, "blurred")
@@ -2089,6 +2183,15 @@ class HighResRunnerSuite:
                     fence_info=fence_info,
                     is_full_frame=is_full_frame,
                 )
+
+                details["sharp_subject"] = round(sharp_subject, 1)
+                details["sharp_box"] = round(sharpness_box, 1)
+                premium_min = float(sf.get("premium_min_sharpness", 0))
+                if quality_class == "premium" and premium_min > 0 and sharpness < premium_min:
+                    quality_class = "good"
+                    details["quality_class"] = "good"
+                    details["demoted_reason"] = "soft_for_premium"
+                    self._inc("demoted_soft")
 
                 # Completeness guard: keep partial / head-truncated athletes out
                 # of Premium/Good. Soft by default (demote to Review); nothing is
@@ -2289,10 +2392,7 @@ class HighResRunnerSuite:
                 return False
             print("[AI ENHANCE] gfpgan not found -- installing automatically (this can take a few minutes) ...")
             try:
-                subprocess.check_call([
-                    sys.executable, "-m", "pip", "install", "--upgrade",
-                    "gfpgan", "realesrgan", "basicsr", "facexlib",
-                ])
+                self._install_enhancer_deps()
             except Exception as exc:
                 print(f"[WARN] Automatic installation of gfpgan failed: {exc}")
                 print("       You can install it manually with: pip install gfpgan realesrgan basicsr facexlib")
@@ -2566,7 +2666,7 @@ class HighResRunnerSuite:
             "quality_premium", "quality_good", "quality_review", "fallback_saved",
             "no_person", "too_small", "unsafe_edge", "bad_pose", "blurred",
             "fence_rejected", "low_quality_score", "crop_failed",
-            "demoted_partial", "partial_body", "truncated_frame", "write_failed", "errors"
+            "demoted_partial", "demoted_soft", "partial_body", "truncated_frame", "write_failed", "errors"
         ]:
             print(f"{key:24s}: {self.stats.get(key, 0)}")
         if report_path is not None:

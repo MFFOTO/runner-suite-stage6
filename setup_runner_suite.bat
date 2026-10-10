@@ -10,7 +10,7 @@ echo.
 
 if not exist "settings.json" (
     if exist "settings.example.json" (
-        echo [0/5] Erstelle settings.json aus settings.example.json ...
+        echo [0/6] Erstelle settings.json aus settings.example.json ...
         copy "settings.example.json" "settings.json" >nul
         echo        Bitte input_folder und output_folder in settings.json anpassen.
         echo.
@@ -26,7 +26,7 @@ if errorlevel 1 (
 )
 
 if not exist ".venv\Scripts\python.exe" (
-    echo [1/5] Erzeuge lokale Python-Umgebung .venv ...
+    echo [1/6] Erzeuge lokale Python-Umgebung .venv ...
     python -m venv .venv
     if errorlevel 1 (
         echo [FEHLER] Virtuelle Umgebung konnte nicht erstellt werden.
@@ -41,12 +41,12 @@ if not exist ".venv\Scripts\python.exe" (
         exit /b 1
     )
 ) else (
-    echo [1/5] Lokale Python-Umgebung .venv ist vorhanden.
+    echo [1/6] Lokale Python-Umgebung .venv ist vorhanden.
 )
 
 call ".venv\Scripts\activate.bat"
 
-echo [2/5] Aktualisiere pip, setuptools und wheel ...
+echo [2/6] Aktualisiere pip, setuptools und wheel ...
 python -m pip install --upgrade pip setuptools wheel
 if errorlevel 1 (
     echo [FEHLER] pip konnte nicht aktualisiert werden.
@@ -54,14 +54,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/5] Installiere PyTorch ...
+echo [3/6] Installiere PyTorch ...
 where nvidia-smi >nul 2>&1
 if errorlevel 1 (
     echo Keine NVIDIA-GPU erkannt. Installiere PyTorch CPU-Version.
     python -m pip install --upgrade torch torchvision torchaudio
 ) else (
-    echo NVIDIA-GPU erkannt. Installiere PyTorch CUDA 12.4-Version.
-    python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    echo NVIDIA-GPU erkannt. Installiere PyTorch CUDA 12.8-Version (RTX 50xx braucht cu128).
+    python -m pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 )
 if errorlevel 1 (
     echo [FEHLER] PyTorch-Installation fehlgeschlagen.
@@ -69,7 +69,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [4/5] Installiere Runner-Suite-Bibliotheken ...
+echo [4/6] Installiere Runner-Suite-Bibliotheken ...
 python -m pip install --upgrade -r requirements.txt
 if errorlevel 1 (
     echo [FEHLER] Installation aus requirements.txt fehlgeschlagen.
@@ -77,7 +77,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [5/5] Pruefe CUDA und Bibliotheken ...
+echo [5/6] Installiere KI-Upscaling (Real-ESRGAN/GFPGAN) und bereinige OpenCV ...
+python install_enhancer_deps.py
+if errorlevel 1 (
+    echo [WARNUNG] Real-ESRGAN/GFPGAN konnten nicht installiert werden.
+    echo           Die Suite laeuft trotzdem; run_enhancer.bat faellt dann auf FSRCNN/Lanczos zurueck.
+)
+
+echo [6/6] Pruefe CUDA und Bibliotheken ...
 python check_cuda_environment.py
 if errorlevel 1 (
     echo [FEHLER] CUDA-/Bibliothekspruefung fehlgeschlagen.
