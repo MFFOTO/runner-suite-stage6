@@ -96,6 +96,7 @@
   "quality_scoring": {
     "save_quality_subfolders": true,
     "save_review": false,
+    "premium_only": false,
     "hard_reject_below_score": 62,
     "classes": {
       "premium": 73,
@@ -118,7 +119,8 @@
   "performance": {
     "workers": "auto",
     "batch_size": "auto",
-    "prefetch_maxsize": "auto"
+    "prefetch_maxsize": "auto",
+    "fast_path": true
   },
   "debug": {
     "write_csv": true,

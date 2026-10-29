@@ -298,6 +298,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "quality_scoring": {
         "save_quality_subfolders": True,
         "save_review": False,
+        # True: only Premium crops are written at all; Good, Review and Reject are
+        # dropped before they are resized, sharpened, encoded or written. Default
+        # False keeps today's behaviour (Premium and Good are saved).
+        "premium_only": False,
         "hard_reject_below_score": 62,
         "classes": {
             "premium": 73,
@@ -321,6 +325,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "workers": 20,
         "batch_size": 1,
         "prefetch_maxsize": 4,
+        # Skip judging work that cannot change what is saved: the fence check and
+        # scoring for a runner that cannot reach the lowest class being kept, the
+        # whole-box sharpness figure that is only reported, and everything after the
+        # keypoint check for a runner the completeness guard would drop. The same
+        # crops are written either way (test_fast_path.py); switch off to compare.
+        "fast_path": True,
     },
     "debug": {
         "write_csv": True,
@@ -2055,8 +2065,24 @@ class HighResRunnerSuite:
     # ------------------------------------------------------------------
     # Main per-image logic
     # ------------------------------------------------------------------
+    _NEUTRAL_FENCE = {"fence_detected": False, "fence_score": 0.0, "vertical_line_count": 0,
+                      "person_occlusion_coverage": 0.0, "central_occlusion_score": 0.0,
+                      "vertical_line_coverage": 0.0}
+
+    def _saveable_floor(self) -> Optional[float]:
+        """The lowest quality score at which a candidate could still be saved, or None
+        when pruning by score would not be exact (Good and Review crops are both saved)."""
+        qs = self.cfg["quality_scoring"]
+        premium_only = bool(qs.get("premium_only", False))
+        if not premium_only and bool(qs.get("save_review", False)):
+            return None
+        classes = qs.get("classes", {})
+        return float(classes.get("premium", 73) if premium_only else classes.get("good", 60))
+
     def _should_save_class(self, quality_class: str, score: float) -> bool:
         qs = self.cfg["quality_scoring"]
+        if bool(qs.get("premium_only", False)):
+            return quality_class == "premium"
         if quality_class == "reject":
             return score >= float(qs.get("hard_reject_below_score", 62)) and bool(qs.get("save_review", False))
         if quality_class == "review" and not bool(qs.get("save_review", False)):
@@ -2189,6 +2215,14 @@ class HighResRunnerSuite:
             keypoint_conf = float(sf.get("keypoint_conf", 0.30))
             min_keypoints = int(sf.get("min_keypoints", 4))
             min_sharp = float(sf.get("min_sharpness_threshold", 80))
+            # Work that cannot change what is saved is skipped (performance.fast_path).
+            # Exactness needs the rejects not to be written to disk for inspection.
+            fast = bool(self.cfg.get("performance", {}).get("fast_path", True)) and not bool(
+                self.cfg["debug"].get("save_rejects", False))
+            floor = self._saveable_floor() if fast else None
+            premium_only = bool(self.cfg["quality_scoring"].get("premium_only", False))
+            premium_min = float(sf.get("premium_min_sharpness", 0))
+            guard_on = bool(self.cfg.get("completeness_guard", {}).get("enabled", True))
 
             for i, person_box in enumerate(boxes):
                 x1, y1, x2, y2 = person_box
@@ -2232,6 +2266,17 @@ class HighResRunnerSuite:
                             self._report({**base_row, "decision": "reject", "reason": "no_frontal_face"})
                             continue
 
+                if floor is not None and guard_on and not is_full_frame:
+                    # An incomplete runner is demoted by the guard below and then not kept,
+                    # so measuring, fence-checking and scoring it would be wasted effort.
+                    early = self._assess_completeness(kp, person_box, (h_img, w_img))
+                    if not early["ok_for_premium"]:
+                        self._inc("skipped_early_partial")
+                        self._report({**base_row, "decision": "reject",
+                                      "reason": "skipped_" + str(early["reason"] or "partial_body"),
+                                      "completeness": early["completeness"]})
+                        continue
+
                 if is_full_frame:
                     crop, crop_box = self.get_full_frame_crop(img, person_box)
                 else:
@@ -2245,15 +2290,35 @@ class HighResRunnerSuite:
                 # Sharpness first — cheaper than fence detection (no morphological ops),
                 # so blurry crops are rejected before the more expensive fence check runs.
                 sharp_roi = crop if is_full_frame else self._extract_roi(img, person_box)
-                sharpness_box = self.get_sharpness_score(sharp_roi)
-                sharp_subject = self.get_subject_sharpness(img, kp, person_box)
                 use_subject = str(sf.get("sharpness_metric", "subject")).lower() == "subject"
+                # In "subject" mode the whole-box figure is only reported, never used to decide.
+                sharpness_box = None if (fast and use_subject) else self.get_sharpness_score(sharp_roi)
+                sharp_subject = self.get_subject_sharpness(img, kp, person_box)
                 sharpness = sharp_subject if use_subject else sharpness_box
                 if bool(sf.get("hard_reject_extreme_blur", True)) and sharpness < min_sharp:
                     self._inc("blurred")
                     reject_path = self._save_reject_crop(img, crop_box, img_path, i, "blurred")
                     self._report({**base_row, "decision": "reject", "reason": "blurred", "sharpness": round(sharpness, 2), "reject_path": reject_path})
                     continue
+
+                if floor is not None:
+                    why = None
+                    if premium_only and premium_min > 0 and sharpness < premium_min:
+                        why = "soft"                      # cannot be Premium, and only Premium is kept
+                    else:
+                        # A fence can only lower the score, so scoring as if there were none is
+                        # a ceiling. If even that is below the line, the fence check cannot help.
+                        ceiling = self.calculate_quality_score(
+                            img=img, crop_box=crop_box, person_box=person_box, kp=kp, boxes=boxes,
+                            current_idx=i, sharpness=sharpness, conf=conf,
+                            fence_info=self._NEUTRAL_FENCE, is_full_frame=is_full_frame)[0]
+                        if ceiling < floor:
+                            why = "score"
+                    if why:
+                        self._inc("skipped_fence_" + why)
+                        self._report({**base_row, "decision": "reject", "reason": "skipped_" + why,
+                                      "sharpness": round(sharpness, 2)})
+                        continue
 
                 fence_info = self.detect_fence(crop, crop_box, person_box)
                 if bool(sf.get("hard_reject_fence", True)) and bool(fence_info.get("fence_detected", False)):
@@ -2276,7 +2341,7 @@ class HighResRunnerSuite:
                 )
 
                 details["sharp_subject"] = round(sharp_subject, 1)
-                details["sharp_box"] = round(sharpness_box, 1)
+                details["sharp_box"] = None if sharpness_box is None else round(sharpness_box, 1)
                 premium_min = float(sf.get("premium_min_sharpness", 0))
                 if quality_class == "premium" and premium_min > 0 and sharpness < premium_min:
                     quality_class = "good"
