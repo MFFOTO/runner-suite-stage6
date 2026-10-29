@@ -90,6 +90,9 @@
     "jpeg_quality": 95,
     "preserve_exif": true
   },
+  "completeness_guard": {
+    "edge_truncation_guard": true
+  },
   "quality_scoring": {
     "save_quality_subfolders": true,
     "save_review": false,

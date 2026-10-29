@@ -199,6 +199,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "require_lower_body": True,     # need a hip OR a knee/ankle for A/B (catches head/torso-only crops)
         "truncation_guard": True,       # detect a head cut off by the frame top
         "edge_margin_px": 6,            # px from a border that counts as "touching"
+        # A runner whose box touches the photo's LEFT or RIGHT edge is cut off by
+        # the frame and cannot be Premium/Good. The top edge is covered by
+        # truncation_guard above; this adds the sides. It also stops a close-up
+        # touching the left, right or top edge from taking the full-frame path,
+        # which bypasses the safe zone, the keypoint minimum and this guard.
+        "edge_truncation_guard": True,
         "review_on_partial": True,      # True = demote to Review; False = reject
         "head_estimate_ratio": 0.22,    # min head allowance (x person height) when the head is weak
     },
@@ -1423,9 +1429,22 @@ class HighResRunnerSuite:
     # ------------------------------------------------------------------
     # Crop logic
     # ------------------------------------------------------------------
+    def _cut_by_frame(self, box: Box, img_shape: Tuple[int, int], top: bool = False) -> bool:
+        """True if the person box runs into the photo's left or right edge (or, with
+        top=True, its top edge): the athlete continues beyond the frame."""
+        cg = self.cfg.get("completeness_guard", {})
+        if not bool(cg.get("edge_truncation_guard", True)):
+            return False
+        h_img, w_img = img_shape[:2]
+        margin = float(cg.get("edge_margin_px", 6))
+        x1, y1, x2, _ = (float(v) for v in box[:4])
+        return x1 <= margin or x2 >= w_img - margin or (top and y1 <= margin)
+
     def _is_full_frame_runner(self, box: Box, img_shape: Tuple[int, int]) -> bool:
         if not bool(self.cfg["full_frame_runner"].get("enabled", True)):
             return False
+        if self._cut_by_frame(box, img_shape, top=True):
+            return False                # cut off by the frame: judged like any other runner
         h_img, w_img = img_shape
         x1, y1, x2, y2 = box
         box_h_ratio = (y2 - y1) / max(1.0, h_img)
@@ -1518,7 +1537,12 @@ class HighResRunnerSuite:
             reason = "no_upper_body"
         elif not has_lower_body:
             reason = "no_lower_body"
+        truncated_side = self._cut_by_frame(person_box, img_shape)
+        if truncated_side and not demote:
+            demote = True
+            reason = "truncated_side"
         return {
+            "truncated_side": truncated_side,
             "has_head": has_head, "has_upper_body": has_upper_body,
             "has_lower_body": has_lower_body, "partial_lower_body": partial_lower_body,
             "truncated_top": truncated_top, "truncated_bottom": truncated_bottom,
