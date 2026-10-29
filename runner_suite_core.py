@@ -1927,16 +1927,83 @@ class HighResRunnerSuite:
         interpolation = cv2.INTER_AREA if crop.shape[0] > target_h else cv2.INTER_LANCZOS4
         return cv2.resize(crop, (final_w, target_h), interpolation=interpolation)
 
-    def _copy_exif_without_orientation(self, src: Path, dst: Path) -> None:
+    @staticmethod
+    def _jpeg_size(path: Path) -> Optional[Tuple[int, int]]:
+        """(width, height) from a JPEG's header, without decoding it."""
+        try:
+            with open(path, "rb") as f:
+                if f.read(2) != b"\xff\xd8":
+                    return None
+                while True:
+                    b = f.read(1)
+                    if not b:
+                        return None
+                    if b != b"\xff":
+                        continue
+                    m = f.read(1)
+                    while m == b"\xff":
+                        m = f.read(1)
+                    if not m or m in (b"\x00", b"\x01") or b"\xd0" <= m <= b"\xd8":
+                        continue
+                    n = int.from_bytes(f.read(2), "big")
+                    if b"\xc0" <= m <= b"\xcf" and m not in (b"\xc4", b"\xc8", b"\xcc"):
+                        data = f.read(5)
+                        return int.from_bytes(data[3:5], "big"), int.from_bytes(data[1:3], "big")
+                    f.seek(n - 2, 1)
+        except OSError:
+            return None
+
+    def _warn_once(self, key: str, msg: str) -> None:
+        seen = self.__dict__.setdefault("_warned_once", set())
+        if key not in seen:
+            seen.add(key)
+            print(f"[WARN] {msg}")
+
+    def _copy_exif_without_orientation(self, src: Path, dst: Path, size: Optional[Tuple[int, int]] = None) -> bool:
+        """Copy the source photo's EXIF (capture date, camera, lens ...) into dst.
+
+        What is not copied, and why:
+          * Orientation  -- the pixels were already rotated on read, so the tag would
+                            rotate them a second time in every viewer;
+          * the thumbnail -- it is a picture of the uncropped original.
+        The pixel dimensions are set to the real size of dst (size=(w, h), or read from
+        its header). A maker note too large for one JPEG segment is dropped and the rest
+        kept. Returns True if the EXIF was written; a failure is reported once, not hidden.
+        """
         if piexif is None or not bool(self.cfg["image_quality"].get("preserve_exif", True)):
-            return
+            return False
         try:
             exif_dict = piexif.load(str(src))
-            if "0th" in exif_dict:
-                exif_dict["0th"].pop(piexif.ImageIFD.Orientation, None)
-            piexif.insert(piexif.dump(exif_dict), str(dst))
-        except Exception:
-            pass
+        except Exception as exc:
+            self._warn_once("exif-read", f"could not read EXIF from {Path(src).name} ({exc}); "
+                                         f"outputs from unreadable sources carry no EXIF")
+            return False
+        try:
+            for k in ("0th", "Exif", "GPS", "Interop"):
+                exif_dict[k] = dict(exif_dict.get(k) or {})
+            exif_dict.pop("1st", None)
+            exif_dict.pop("thumbnail", None)
+            exif_dict["0th"].pop(piexif.ImageIFD.Orientation, None)
+            wh = size or self._jpeg_size(dst)
+            if wh:
+                exif_dict["Exif"][piexif.ExifIFD.PixelXDimension] = int(wh[0])
+                exif_dict["Exif"][piexif.ExifIFD.PixelYDimension] = int(wh[1])
+            else:                                            # better absent than the source's size
+                exif_dict["Exif"].pop(piexif.ExifIFD.PixelXDimension, None)
+                exif_dict["Exif"].pop(piexif.ExifIFD.PixelYDimension, None)
+            blob = None
+            try:
+                blob = piexif.dump(exif_dict)
+            except Exception:
+                pass
+            if blob is None or len(blob) + 2 > 0xFFFF:       # does not fit one APP1 segment
+                exif_dict["Exif"].pop(piexif.ExifIFD.MakerNote, None)
+                blob = piexif.dump(exif_dict)
+            piexif.insert(blob, str(dst))
+            return True
+        except Exception as exc:
+            self._warn_once("exif-write", f"EXIF not written to {Path(dst).name} ({exc})")
+            return False
 
     def write_output(
         self,
@@ -1969,7 +2036,7 @@ class HighResRunnerSuite:
         ok = cv2.imwrite(str(out_path), final, [cv2.IMWRITE_JPEG_QUALITY, int(iq.get("jpeg_quality", 95))])
         if not ok:
             return None
-        self._copy_exif_without_orientation(src_path, out_path)
+        self._copy_exif_without_orientation(src_path, out_path, (final.shape[1], final.shape[0]))
         return out_path
 
     def _save_reject_crop(self, img: Any, crop_box: Optional[Box], src_path: Path, idx: int, reason: str) -> str:
@@ -2551,7 +2618,7 @@ class HighResRunnerSuite:
                 out_path = out_folder / img_path.name
                 ok = cv2.imwrite(str(out_path), enhanced, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
                 if ok:
-                    self._copy_exif_without_orientation(img_path, out_path)
+                    self._copy_exif_without_orientation(img_path, out_path, (enhanced.shape[1], enhanced.shape[0]))
                     done += 1
                 else:
                     failed += 1
