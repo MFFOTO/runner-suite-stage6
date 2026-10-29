@@ -2447,6 +2447,17 @@ class HighResRunnerSuite:
         cfg = self.cfg.get("whole_image_fallback", {})
         if not bool(cfg.get("enabled", False)):
             return
+        # The fallback writes straight to disk, so it never went through
+        # _should_save_class: with premium_only on it would still have written
+        # Review/Good crops. Honour premium_only here, before doing any work.
+        # (save_review is deliberately not applied: enabling the fallback with
+        # save_class "review" is an explicit request to save those crops.)
+        fallback_class = str(cfg.get("save_class", "review"))
+        if bool(self.cfg["quality_scoring"].get("premium_only", False)) and fallback_class != "premium":
+            self._inc("fallback_not_saved")
+            self._report({"image": str(img_path), "candidate_idx": "fallback", "decision": "reject",
+                          "reason": f"fallback_class_{fallback_class}_not_saved_premium_only"})
+            return
         crop, crop_box = self._crop_to_aspect_around_center(img, img.shape[1] / 2.0, img.shape[0] / 2.0)
         # Whole-image fallback has no person box; use the crop box as an approximation.
         pseudo_person_box = crop_box
